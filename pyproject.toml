@@ -1,6 +1,6 @@
 [project]
 name = "claude-watcher-gtk"
-version = "0.21.0"
+version = "1.0.0"
 description = "GTK3 desktop widget that monitors running Claude Code sessions"
 requires-python = ">=3.10"
 dependencies = [

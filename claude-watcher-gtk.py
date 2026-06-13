@@ -75,7 +75,7 @@ CONFIG_DIR  = Path.home() / '.config' / 'claude-watcher'
 CONFIG_PATH = CONFIG_DIR / 'config.ini'
 POS_FILE    = CONFIG_DIR / 'position.json'
 
-VERSION = "0.21.0"  # bumped automatically by CI
+VERSION = "1.0.0"  # bumped automatically by CI
 
 # Glyphe titre terminal émis par Claude Code (séquence OSC)
 CLAUDE_IDLE_GLYPH = '✳'   # prompt visible, attend l'utilisateur
