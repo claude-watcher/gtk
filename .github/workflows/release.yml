@@ -1,0 +1,42 @@
+name: release
+
+# Tag a version to cut a release:
+#   git tag v0.22.0 && git push origin v0.22.0
+# The job stamps the tag into the shipped script + installer and publishes a
+# GitHub Release. Users then install with:
+#   curl -fsSL https://github.com/claude-watcher/gtk/releases/latest/download/install.sh | bash
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version into assets
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"        # e.g. v0.22.0
+          BARE="${TAG#v}"                 # e.g. 0.22.0
+          sed -i "s/^VERSION = \"[^\"]*\"/VERSION = \"${BARE}\"/" claude-watcher-gtk.py
+          sed -i "s/__VERSION__/${TAG}/"  install.sh
+          echo "Released ${TAG}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            claude-watcher-gtk.py \
+            claude-logo.svg \
+            install.sh \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes
