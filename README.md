@@ -55,9 +55,15 @@ To **upgrade**, just re-run the `latest` one-liner.
 
 The installer will:
 1. Install missing apt dependencies
-2. Download the script to `~/bin/claude-watcher`
+2. Install the script to `~/.local/share/claude-watcher/`
 3. Write `~/.config/claude-watcher/config.ini` (skipped if it already exists)
-4. Register GNOME autostart so the widget launches at login
+4. Add an app-menu launcher and register autostart so the widget launches at login
+
+To **uninstall** (removes the script and desktop entries; keeps your config):
+
+```bash
+./install.sh --uninstall
+```
 
 <details>
 <summary>From a local clone (development)</summary>
@@ -77,10 +83,11 @@ cd gtk
 
 ## Usage
 
-The widget starts automatically after install. To launch it manually:
+The widget starts automatically after install. To launch it manually, use the
+**Claude Code Watcher** app-menu entry, or:
 
 ```bash
-/usr/bin/python3 ~/bin/claude-watcher &
+/usr/bin/python3 ~/.local/share/claude-watcher/claude-watcher &
 ```
 
 It starts anchored to the **bottom-right corner** of the configured screen. Drag

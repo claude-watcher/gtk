@@ -55,9 +55,15 @@ Pour **monter de version**, relance simplement la commande `latest`.
 
 L'installateur :
 1. Installe les dépendances apt manquantes
-2. Télécharge le script dans `~/bin/claude-watcher`
+2. Installe le script dans `~/.local/share/claude-watcher/`
 3. Crée `~/.config/claude-watcher/config.ini` (ignoré s'il existe déjà)
-4. Enregistre l'autostart GNOME pour lancer le widget à la connexion
+4. Ajoute une entrée au menu des applications et enregistre l'autostart pour lancer le widget à la connexion
+
+Pour **désinstaller** (supprime le script et les entrées de bureau ; conserve ta config) :
+
+```bash
+./install.sh --uninstall
+```
 
 <details>
 <summary>Depuis un clone local (développement)</summary>
@@ -77,10 +83,11 @@ cd gtk
 
 ## Utilisation
 
-Le widget démarre automatiquement après l'installation. Pour le lancer manuellement :
+Le widget démarre automatiquement après l'installation. Pour le lancer manuellement,
+utilise l'entrée **Claude Code Watcher** du menu des applications, ou :
 
 ```bash
-/usr/bin/python3 ~/bin/claude-watcher &
+/usr/bin/python3 ~/.local/share/claude-watcher/claude-watcher &
 ```
 
 Il démarre ancré en **bas à droite** de l'écran configuré. Glisser l'en-tête pour
