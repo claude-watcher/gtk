@@ -1710,8 +1710,8 @@ class ClaudeWatcher(Gtk.Window):
         dlg.set_program_name("Claude Code Watcher")
         dlg.set_version(VERSION)
         dlg.set_comments("GTK3 desktop widget — monitors running Claude Code sessions.")
-        dlg.set_website("https://gitlab.com/geoffrey.laurent/claude-watcher")
-        dlg.set_website_label("GitLab")
+        dlg.set_website("https://github.com/claude-watcher/gtk")
+        dlg.set_website_label("GitHub")
         dlg.set_license_type(Gtk.License.MIT_X11)
         dlg.set_authors(["Geoffrey LAURENT", "Damien Degois"])
         try:
