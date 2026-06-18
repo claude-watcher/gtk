@@ -700,11 +700,10 @@ def get_session_state(pid: int, cwd: str | None,
                       config_dir: str | None = None) -> tuple[str, int | None, str | None]:
     """État de la session. Retourne (state, context_pct, tool_name).
 
-    Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) reste
-    prioritaire s'il existe, mais les versions récentes de Claude Code ne
-    l'écrivent plus : en pratique l'état vient donc du JSONL pour quasiment
-    toutes les sessions. Le JSONL fournit aussi le % de contexte et l'outil
-    courant (absents du registre).
+    Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) est
+    prioritaire quand il existe ; selon la version de Claude Code il peut être
+    absent, auquel cas l'état est déduit du JSONL. Le JSONL fournit dans tous
+    les cas le % de contexte et l'outil courant (absents du registre).
 
     `sessionId` du registre, quand il existe, donne le chemin EXACT du JSONL ;
     sinon on devine par slug du cwd.

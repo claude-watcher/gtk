@@ -76,7 +76,7 @@ cd gtk
 </details>
 
 > **Aucun hook à installer :** l'état provient des fichiers de session propres à
-> Claude Code (transcripts) — rien à ajouter dans ton `settings.json`.
+> Claude Code — rien à ajouter dans ton `settings.json`.
 
 > **Important :** Utiliser impérativement `/usr/bin/python3`, pas un Python
 > Homebrew/pyenv — ceux-ci n'ont pas accès aux bindings GTK système.
