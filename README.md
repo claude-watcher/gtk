@@ -75,8 +75,8 @@ cd gtk
 ```
 </details>
 
-> **No hook to install:** status comes from Claude Code's own per-session
-> registry, so there's nothing to add to your `settings.json`.
+> **No hook to install:** status comes from Claude Code's own session files
+> (transcripts), so there's nothing to add to your `settings.json`.
 
 > **Note:** Must use `/usr/bin/python3`, not a Homebrew/pyenv Python — those don't
 > have access to system GTK bindings.
