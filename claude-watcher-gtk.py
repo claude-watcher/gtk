@@ -1719,7 +1719,10 @@ class ClaudeWatcher(Gtk.Window):
         dlg.set_website("https://github.com/claude-watcher/gtk")
         dlg.set_website_label("GitHub")
         dlg.set_license_type(Gtk.License.MIT_X11)
-        dlg.set_authors(["Geoffrey LAURENT", "Damien Degois"])
+        dlg.set_authors([
+            "kardagan",
+            "babs <https://github.com/babs> (Damien Degois)",
+        ])
         try:
             logo_path = str(CONFIG_DIR / 'claude-logo.svg')
             pb = GdkPixbuf.Pixbuf.new_from_file_at_size(logo_path, 64, 64)
