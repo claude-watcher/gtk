@@ -75,7 +75,7 @@ cd gtk
 ```
 </details>
 
-> **Aucun hook à installer :** l'état provient du registre de sessions propre à
+> **Aucun hook à installer :** l'état provient des fichiers de session propres à
 > Claude Code — rien à ajouter dans ton `settings.json`.
 
 > **Important :** Utiliser impérativement `/usr/bin/python3`, pas un Python

@@ -624,7 +624,12 @@ def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str 
         kind = ev.get('type', '')
         if state is None:
             if kind == 'assistant':
-                state = 'waiting'
+                # stop_reason discriminates "working" from "waiting": 'tool_use'
+                # (a tool was dispatched, result pending) or a still-streaming
+                # message (None) means Claude is busy; only a terminal end-of-turn
+                # reason means it handed control back and is waiting on the user.
+                sr = (ev.get('message') or {}).get('stop_reason')
+                state = 'working' if sr in (None, 'tool_use', 'pause_turn') else 'waiting'
             elif kind == 'user':
                 state = 'working'
             elif kind == 'system':
@@ -744,14 +749,13 @@ def get_session_state(pid: int, cwd: str | None,
                       config_dir: str | None = None) -> tuple[str, int | None, str | None]:
     """État de la session. Retourne (state, context_pct, tool_name).
 
-    Source primaire : le registre ~/.claude/sessions/<pid>.json maintenu par
-    Claude lui-même (champ `status`, temps réel). Le JSONL ne sert plus qu'à
-    compléter le % de contexte et le nom de l'outil courant (absents du
-    registre), et de FALLBACK d'état si le registre manque — session lancée par
-    une version de Claude antérieure à ce mécanisme.
+    Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) est
+    prioritaire quand il existe ; selon la version de Claude Code il peut être
+    absent, auquel cas l'état est déduit du JSONL. Le JSONL fournit dans tous
+    les cas le % de contexte et l'outil courant (absents du registre).
 
-    `sessionId` du registre donne le chemin EXACT du JSONL (plus de devinage par
-    slug du cwd).
+    `sessionId` du registre, quand il existe, donne le chemin EXACT du JSONL ;
+    sinon on devine par slug du cwd.
     """
     reg = get_session_registry(pid, starttime)
     session_id = reg.get('sessionId') if reg else None
