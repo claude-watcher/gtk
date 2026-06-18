@@ -18,7 +18,7 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
 - **Shift + mouse wheel** adjusts opacity live
 - Mouse wheel on the title bar — or the ▾/▸ chevron — rolls the widget up/down
 - Configurable global hotkey (default `<Ctrl><Alt>q`) to start keyboard navigation
-- Drag the header to reposition freely — position is remembered across restarts
+- Drag the header or footer to reposition freely — position is remembered across restarts
 - Systray icon with global status indicator
 - Language auto-detected from system locale (`fr` / `en`)
 
@@ -91,7 +91,7 @@ The widget starts automatically after install. To launch it manually, use the
 ```
 
 It starts anchored to the **bottom-right corner** of the configured screen. Drag
-the header bar to move it freely — the position is saved and restored on next launch.
+the header or footer bar to move it freely — the position is saved and restored on next launch.
 
 All settings are editable from the **Settings** screen (right-click → Settings) —
 no need to touch a config file by hand.

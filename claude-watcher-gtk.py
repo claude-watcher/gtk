@@ -1392,11 +1392,17 @@ class ClaudeWatcher(Gtk.Window):
         lbl_version.set_markup(f'<span font_desc="7" color="{TEXT_DIM}">v{VERSION}</span>')
         lbl_version.set_halign(Gtk.Align.END)
         footer.pack_end(lbl_version, False, False, 0)
-        self.main_box.pack_start(footer, False, False, 0)
+
+        # Footer draggable too — same handler as header (widget-agnostic).
+        footer_evt = Gtk.EventBox()
+        footer_evt.set_visible_window(False)  # let the toplevel custom bg paint through
+        footer_evt.add(footer)
+        footer_evt.connect('button-press-event', self._on_header_press)
+        self.main_box.pack_start(footer_evt, False, False, 0)
 
         # Shade (roll-up): everything below the header can be collapsed
         self._rolled = False
-        self._roll_widgets = [sep_top, self.sessions_box, sep_bottom, footer]
+        self._roll_widgets = [sep_top, self.sessions_box, sep_bottom, footer_evt]
         self._update_chevron()
 
         # ── Init ────────────────────────────────────────────────────────────

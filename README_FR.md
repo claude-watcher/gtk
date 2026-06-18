@@ -18,7 +18,7 @@ Un widget de bureau GTK3 pour Ubuntu qui surveille toutes les sessions Claude Co
 - **Maj + molette** pour ajuster l'opacité en direct
 - Molette sur la barre de titre — ou le chevron ▾/▸ — pour enrouler/dérouler le widget
 - Raccourci clavier global configurable (défaut `<Ctrl><Alt>q`) pour lancer la navigation clavier
-- Drag de l'en-tête pour repositionner librement — la position est mémorisée
+- Drag de l'en-tête ou du pied pour repositionner librement — la position est mémorisée
 - Icône systray avec indicateur d'état global
 - Langue auto-détectée depuis la locale système (`fr` / `en`)
 
