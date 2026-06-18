@@ -51,7 +51,9 @@ import re
 import subprocess
 import signal
 import sys
+import threading
 import time
+import urllib.request
 import warnings
 from pathlib import Path
 
@@ -76,6 +78,17 @@ CONFIG_PATH = CONFIG_DIR / 'config.ini'
 POS_FILE    = CONFIG_DIR / 'position.json'
 
 VERSION = "1.0.0"  # bumped automatically by CI
+
+# Update check — latest published release on GitHub
+GITHUB_RELEASES_API = "https://api.github.com/repos/claude-watcher/gtk/releases/latest"
+RELEASES_URL        = "https://github.com/claude-watcher/gtk/releases"
+
+def _semver_tuple(s: str) -> tuple[int, ...]:
+    """Loose semver → comparable int tuple. 'v1.2.3' → (1, 2, 3)."""
+    parts = [int(n) for n in re.findall(r'\d+', s or '')][:3]
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
 
 # Glyphe titre terminal émis par Claude Code (séquence OSC)
 CLAUDE_IDLE_GLYPH = '✳'   # prompt visible, attend l'utilisateur
@@ -175,6 +188,23 @@ STRINGS = {
         'snooze_hide':   'Masquer pendant',
         'about':         'À propos…',
         'quit':          'Quitter',
+        # version / mise à jour
+        'ver_uptodate':  'À jour',
+        'ver_outdated':  'Mise à jour disponible',
+        'ver_checking':  'Vérification de la version…',
+        'ver_unknown':   'Version à jour inconnue (hors-ligne ?)',
+        'ver_current':   'Version installée',
+        'ver_click_hint':'Cliquer pour le détail',
+        'ver_latest':    'Dernière version',
+        'ver_status':    'Statut',
+        'see_releases':  'Voir les releases',
+        'update_cmd':    'Commande de mise à jour',
+        'copy':          'Copier',
+        'tab_about':     'À propos',
+        'tab_version':   'Version',
+        'tab_credits':   'Crédits',
+        'authors':       'Auteurs',
+        'close':         'Fermer',
         # dialogue paramètres
         'settings_title': 'Paramètres — Claude Code Watcher',
         'cancel':         'Annuler',
@@ -226,6 +256,23 @@ STRINGS = {
         'snooze_hide':   'Hide for',
         'about':         'About…',
         'quit':          'Quit',
+        # version / update
+        'ver_uptodate':  'Up to date',
+        'ver_outdated':  'Update available',
+        'ver_checking':  'Checking version…',
+        'ver_unknown':   'Update status unknown (offline?)',
+        'ver_current':   'Installed version',
+        'ver_click_hint':'Click for details',
+        'ver_latest':    'Latest version',
+        'ver_status':    'Status',
+        'see_releases':  'View releases',
+        'update_cmd':    'Update command',
+        'copy':          'Copy',
+        'tab_about':     'About',
+        'tab_version':   'Version',
+        'tab_credits':   'Credits',
+        'authors':       'Authors',
+        'close':         'Close',
         # settings dialog
         'settings_title': 'Settings — Claude Code Watcher',
         'cancel':         'Cancel',
@@ -285,6 +332,8 @@ COLOR_CLAUDE  = "#cc785c"   # Claude brand orange — marque les instances CLAUD
 COLOR_HOVER   = (1, 1, 1, 0.06)
 COLOR_HOVER_W = (0.91, 0.42, 0.14, 0.10)
 COLOR_KB_SEL  = (1, 1, 1, 0.14)
+COLOR_VER_OK  = "#2e9e5b"   # dark green — installed version is the latest release
+COLOR_VER_OLD = "#e0524f"   # red — a newer release is available
 
 # ── Détection process ─────────────────────────────────────────────────────────
 
@@ -1388,10 +1437,19 @@ class ClaudeWatcher(Gtk.Window):
         footer.set_margin_end(8)
         footer.set_margin_top(5)
         footer.set_margin_bottom(0)
-        lbl_version = Gtk.Label()
-        lbl_version.set_markup(f'<span font_desc="7" color="{TEXT_DIM}">v{VERSION}</span>')
-        lbl_version.set_halign(Gtk.Align.END)
-        footer.pack_end(lbl_version, False, False, 0)
+        # Version label — colored by update state, clickable (opens About).
+        self._latest_version = None
+        self._update_state   = 'checking'   # checking | ok | old | unknown
+        self._lbl_version = Gtk.Label()
+        self._lbl_version.set_halign(Gtk.Align.END)
+        ver_evt = Gtk.EventBox()
+        ver_evt.set_visible_window(False)
+        ver_evt.add(self._lbl_version)
+        ver_evt.connect('button-press-event', self._on_version_press)
+        ver_evt.connect('realize', self._on_version_realize)
+        self._ver_evt = ver_evt
+        self._render_version_label()
+        footer.pack_end(ver_evt, False, False, 0)
 
         # Footer draggable too — same handler as header (widget-agnostic).
         footer_evt = Gtk.EventBox()
@@ -1425,6 +1483,8 @@ class ClaudeWatcher(Gtk.Window):
         self._refresh_timer_id = GLib.timeout_add(cfg.refresh_ms, self._refresh)
         GLib.timeout_add(600, self._tick_anim)
         self._setup_status_monitor()
+        self._check_latest_version_async()
+        GLib.timeout_add_seconds(6 * 3600, self._recheck_version_tick)
 
     # ── Snooze ────────────────────────────────────────────────────────────────
 
@@ -1490,6 +1550,67 @@ class ClaudeWatcher(Gtk.Window):
             return False
         self._set_rolled(not self._rolled)
         return True  # consume — don't start a header drag
+
+    # ── Version / update check ────────────────────────────────────────────────
+
+    def _on_version_press(self, _widget, event):
+        if event.button != 1:
+            return False
+        self._show_about(self.ABOUT_PAGE_VERSION)
+        return True  # consume — don't start a footer drag
+
+    def _on_version_realize(self, widget):
+        # Hand cursor over the (input-only) version window → signals it's clickable.
+        win = widget.get_window()
+        if win:
+            win.set_cursor(Gdk.Cursor.new_from_name(widget.get_display(), 'pointer'))
+
+    def _render_version_label(self):
+        """Paint the footer version label + tooltip from the current state."""
+        color = {'ok': COLOR_VER_OK, 'old': COLOR_VER_OLD}.get(self._update_state, TEXT_DIM2)
+        self._lbl_version.set_markup(f'<span font_desc="8" color="{color}">v{VERSION}</span>')
+
+        if self._update_state == 'ok':
+            tip = f"{tr('ver_uptodate')} — v{VERSION}"
+        elif self._update_state == 'old':
+            tip = (f"{tr('ver_outdated')} : v{self._latest_version}\n"
+                   f"{tr('ver_current')} : v{VERSION}")
+        elif self._update_state == 'unknown':
+            tip = tr('ver_unknown')
+        else:
+            tip = tr('ver_checking')
+        self._ver_evt.set_tooltip_text(f"{tip}\n{tr('ver_click_hint')}")
+
+    def _check_latest_version_async(self):
+        """Fetch the latest GitHub release tag off the main loop."""
+        def worker():
+            latest = None
+            try:
+                req = urllib.request.Request(
+                    GITHUB_RELEASES_API,
+                    headers={'User-Agent': 'claude-watcher-gtk',
+                             'Accept': 'application/vnd.github+json'},
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode('utf-8'))
+                latest = (data.get('tag_name') or '').lstrip('v') or None
+            except Exception:
+                latest = None  # offline / no release / rate-limited → unknown
+            GLib.idle_add(self._apply_version_check, latest)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _recheck_version_tick(self):
+        self._check_latest_version_async()
+        return True  # keep the periodic timer alive
+
+    def _apply_version_check(self, latest):
+        if latest is None:
+            self._update_state, self._latest_version = 'unknown', None
+        else:
+            self._latest_version = latest
+            self._update_state = 'old' if _semver_tuple(latest) > _semver_tuple(VERSION) else 'ok'
+        self._render_version_label()
+        return False  # one-shot idle
 
     def _set_rolled(self, rolled: bool):
         # Shade: collapse everything below the header, WM roll-up style.
@@ -1711,26 +1832,159 @@ class ClaudeWatcher(Gtk.Window):
         menu.show_all()
         return menu
 
-    def _show_about(self):
-        dlg = Gtk.AboutDialog()
-        dlg.set_program_name("Claude Code Watcher")
-        dlg.set_version(VERSION)
-        dlg.set_comments("GTK3 desktop widget — monitors running Claude Code sessions.")
-        dlg.set_website("https://github.com/claude-watcher/gtk")
-        dlg.set_website_label("GitHub")
-        dlg.set_license_type(Gtk.License.MIT_X11)
-        dlg.set_authors([
-            "kardagan",
-            "babs <https://github.com/babs> (Damien Degois)",
-        ])
-        try:
-            logo_path = str(CONFIG_DIR / 'claude-logo.svg')
-            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(logo_path, 64, 64)
-            dlg.set_logo(pb)
-        except Exception:
-            pass
+    # Notebook page indices, in append order.
+    ABOUT_PAGE_GENERAL = 0
+    ABOUT_PAGE_VERSION = 1
+    ABOUT_PAGE_CREDITS = 2
+
+    def _show_about(self, page: int = ABOUT_PAGE_GENERAL):
+        dlg = Gtk.Dialog(title="Claude Code Watcher", transient_for=self, modal=True)
+        dlg.set_default_size(380, 300)
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        dlg.add_button(tr('close'), Gtk.ResponseType.CLOSE)
+
+        nb = Gtk.Notebook()
+        nb.set_border_width(8)
+        nb.append_page(self._about_tab_general(), Gtk.Label(label=tr('tab_about')))
+        nb.append_page(self._about_tab_version(), Gtk.Label(label=tr('tab_version')))
+        nb.append_page(self._about_tab_credits(), Gtk.Label(label=tr('tab_credits')))
+        dlg.get_content_area().pack_start(nb, True, True, 0)
+
+        dlg.show_all()
+        nb.set_current_page(page)  # must run after show_all() or GTK ignores it
         dlg.run()
         dlg.destroy()
+
+    def _about_tab_general(self) -> Gtk.Box:
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.set_border_width(18)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+        try:
+            pb = GdkPixbuf.Pixbuf.new_from_file_at_size(str(CONFIG_DIR / 'claude-logo.svg'), 64, 64)
+            box.pack_start(Gtk.Image.new_from_pixbuf(pb), False, False, 0)
+        except Exception:
+            pass
+        name = Gtk.Label()
+        name.set_markup('<span font="13" weight="bold">Claude Code Watcher</span>')
+        box.pack_start(name, False, False, 0)
+        desc = Gtk.Label(label="GTK3 desktop widget — monitors running Claude Code sessions.")
+        desc.set_line_wrap(True)
+        desc.set_justify(Gtk.Justification.CENTER)
+        box.pack_start(desc, False, False, 0)
+        box.pack_start(Gtk.LinkButton.new_with_label(
+            "https://github.com/claude-watcher/gtk", "GitHub"), False, False, 0)
+        lic = Gtk.Label()
+        lic.set_markup('<span size="small">MIT License</span>')
+        box.pack_start(lic, False, False, 0)
+        return box
+
+    def _about_tab_version(self) -> Gtk.Grid:
+        grid = Gtk.Grid(column_spacing=14, row_spacing=10)
+        grid.set_border_width(18)
+        grid.set_halign(Gtk.Align.CENTER)
+        grid.set_valign(Gtk.Align.CENTER)
+
+        def add_row(r, label, value_markup):
+            lbl = Gtk.Label()
+            lbl.set_markup(f'<span color="{TEXT_DIM2}">{label}</span>')
+            lbl.set_halign(Gtk.Align.END)
+            val = Gtk.Label()
+            val.set_markup(value_markup)
+            val.set_halign(Gtk.Align.START)
+            grid.attach(lbl, 0, r, 1, 1)
+            grid.attach(val, 1, r, 1, 1)
+
+        add_row(0, tr('ver_current'), f'<b>v{VERSION}</b>')
+        add_row(1, tr('ver_latest'), f'v{self._latest_version}' if self._latest_version else '—')
+
+        if self._update_state == 'ok':
+            status = f'<span color="{COLOR_VER_OK}">✓ {tr("ver_uptodate")}</span>'
+        elif self._update_state == 'old':
+            status = f'<span color="{COLOR_VER_OLD}">⚠ {tr("ver_outdated")}</span>'
+        else:
+            status = f'<span color="{TEXT_DIM2}">{tr("ver_unknown")}</span>'
+        add_row(2, tr('ver_status'), status)
+
+        if self._update_state == 'old':
+            cmd = ("pkill -f claude-watcher || true && curl -fsSL "
+                   "https://github.com/claude-watcher/gtk/releases/latest/download/install.sh | bash")
+
+            cmd_title = Gtk.Label()
+            cmd_title.set_markup(f'<span color="{TEXT_DIM2}">{tr("update_cmd")} :</span>')
+            cmd_title.set_halign(Gtk.Align.START)
+            cmd_title.set_margin_top(8)
+            grid.attach(cmd_title, 0, 3, 2, 1)
+
+            # Command in a framed, shaded box (left) + copy button (right).
+            cmd_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            cmd_row.pack_start(self._code_box(cmd), True, True, 0)
+            copy_btn = Gtk.Button.new_with_label(tr('copy'))
+            copy_btn.set_valign(Gtk.Align.CENTER)
+            copy_btn.connect('clicked', lambda b: self._copy_to_clipboard(cmd, b))
+            cmd_row.pack_start(copy_btn, False, False, 0)
+            grid.attach(cmd_row, 0, 4, 2, 1)
+
+            link = Gtk.LinkButton.new_with_label(RELEASES_URL, tr('see_releases'))
+            link.set_halign(Gtk.Align.CENTER)
+            grid.attach(link, 0, 5, 2, 1)
+        return grid
+
+    def _code_box(self, text: str) -> Gtk.Box:
+        """A framed, shaded, monospace block holding a wrapping command line."""
+        lbl = Gtk.Label()
+        lbl.set_markup(f'<tt><span size="small">{GLib.markup_escape_text(text)}</span></tt>')
+        lbl.set_selectable(True)
+        lbl.set_line_wrap(True)
+        lbl.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        lbl.set_max_width_chars(34)
+        lbl.set_xalign(0.0)
+        lbl.set_margin_top(8)
+        lbl.set_margin_bottom(8)
+        lbl.set_margin_start(10)
+        lbl.set_margin_end(10)
+        box = Gtk.Box()
+        box.add(lbl)
+        ctx = box.get_style_context()
+        ctx.add_class('cmd-box')
+        provider = Gtk.CssProvider()
+        provider.load_from_data(
+            b'.cmd-box { background-color: #15151c; '
+            b'border: 1px solid #3a3a4a; border-radius: 6px; }')
+        ctx.add_provider(provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        return box
+
+    def _copy_to_clipboard(self, text: str, button: Gtk.Button):
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(text, -1)
+        label = button.get_child()
+        if not isinstance(label, Gtk.Label):
+            return
+        label.set_markup(f'<span color="{COLOR_VER_OK}" weight="bold">✓</span>')
+        GLib.timeout_add_seconds(2, lambda: (label.set_text(tr('copy')), False)[1])
+
+    def _about_tab_credits(self) -> Gtk.Box:
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        box.set_border_width(18)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        title = Gtk.Label()
+        title.set_markup(f'<span color="{TEXT_DIM2}">{tr("authors")} :</span>')
+        title.set_valign(Gtk.Align.START)
+        box.pack_start(title, False, False, 0)
+
+        names = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        kardagan = Gtk.Label()
+        kardagan.set_markup('<span font="11">kardagan</span>')
+        kardagan.set_halign(Gtk.Align.START)
+        names.pack_start(kardagan, False, False, 0)
+        babs = Gtk.Label()
+        babs.set_markup(f'<a href="https://github.com/babs">babs</a> '
+                        f'<span color="{TEXT_DIM2}">(Damien Degois)</span>')
+        babs.set_halign(Gtk.Align.START)
+        names.pack_start(babs, False, False, 0)
+        box.pack_start(names, False, False, 0)
+        return box
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
