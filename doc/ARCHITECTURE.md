@@ -103,7 +103,7 @@ on Wayland.
   sticky across desktops
 - RGBA visual + Cairo custom background → rounded dark semi-transparent widget
 - `_NET_WM_STRUT_PARTIAL` X11 property → maximized windows stop before the widget
-- Header is draggable — position persisted to `~/.config/claude-watcher/position.json`
+- Header and footer are draggable — position persisted to `~/.config/claude-watcher/position.json`
 - Pulse animation on the waiting dot (`_PULSE_ALPHAS`)
 - Snooze: middle-click → `set_opacity(0.08)` for `snooze_sec` seconds
 - Systray icon (optional): colored dot reflects global state
