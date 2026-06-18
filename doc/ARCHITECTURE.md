@@ -31,29 +31,39 @@ the default corner.
 
 ## Session detection
 
-Status comes from Claude Code's **own per-session registry** — a file Claude
-maintains itself, keyed by PID and updated in real time. No hook required.
+Status comes from the session **transcript** (`~/.claude/projects/<slug>/<sessionId>.jsonl`).
+A per-session registry (`~/.claude/sessions/<pid>.json`) is still preferred when
+present, but **current Claude Code no longer writes it**, so in practice the
+transcript path drives state for every session. No hook required.
 
-1. Claude writes `~/.claude/sessions/<pid>.json` on every state change, with a
-   `status` field, the `sessionId`, and `cwd`.
-2. The widget enumerates sessions by scanning `/proc/<pid>/comm` for an exact
+1. The widget enumerates sessions by scanning `/proc/<pid>/comm` for an exact
    match on `claude`; field 22 of `/proc/<pid>/stat` gives the process
    `starttime` (in ticks).
-3. **State** — read from the registry file:
+2. **State (registry, when present)** — `~/.claude/sessions/<pid>.json` carries a
+   `status` field updated in real time:
    - `busy` / `shell` / `compacting` → **working**
    - `waiting` → **waiting** (Claude is blocked on a permission/notification)
    - `idle` → **idle**
    - `procStart` in the file must match the process `starttime` — a stale file
      from a recycled PID is ignored.
-4. **Context % + current tool** — parsed from the transcript, located exactly via
-   `sessionId` → `~/.claude/projects/<slug>/<sessionId>.jsonl`. Context % is
+   Recent Claude Code releases stopped writing this file; the registry block is
+   retained for older sessions but is otherwise dormant.
+3. **State (transcript fallback — the live path today)** — derived from the most
+   recent meaningful entry, bottom-up:
+   - `assistant` → classified by `message.stop_reason`: `tool_use` / `pause_turn`
+     / still-streaming (`null`) → **working**; a terminal reason (`end_turn`,
+     `max_tokens`, `stop_sequence`, `refusal`) → **waiting**.
+   - `user` → **working**
+   - `system` → **idle**
+   This is coarser than the registry: it cannot tell a tool that is *executing*
+   (working) from one *awaiting permission approval* (which also ends in an
+   `assistant` `tool_use` and genuinely needs the user) — both read as
+   **working**.
+4. **Context % + current tool** — parsed from the same transcript. Context % is
    input tokens / window size; the tool is the `name` of the most recent
-   assistant `tool_use` block.
-5. **Fallback** — if a session's Claude predates the registry, state falls back
-   to the transcript's last-entry type (`assistant` → waiting, `user` → working,
-   `system` → idle). This is coarser: it cannot tell a permission `waiting` from
-   a finished turn.
-6. Walk the process tree to find the parent terminal window (ghostty, kitty,
+   assistant `tool_use` block. With the registry gone, the transcript is located
+   by slugifying `cwd` (see known limitations).
+5. Walk the process tree to find the parent terminal window (ghostty, kitty,
    alacritty, gnome-terminal…).
 
 The terminal-title spinner is **not** used for state — only to pick the right
@@ -64,8 +74,11 @@ window when focusing a multi-window terminal.
 The earlier model installed Claude Code hooks. It couldn't track a genuine
 `waiting` status: Claude fires no hook event when the user *approves* a
 permission, so a long approved tool stayed stuck on `waiting` until
-`PostToolUse`. The registry carries a real `waiting` status, needs no
-`settings.json` changes, and works under Wayland.
+`PostToolUse`. The registry carried a real `waiting` status, needed no
+`settings.json` changes, and worked under Wayland. Now that Claude Code no
+longer writes the registry, the transcript fallback is the active source; it
+recovers most of the signal (working vs waiting) but loses the registry's
+ability to flag a permission wait distinctly from a running tool.
 
 ### Instant refresh
 
@@ -112,10 +125,15 @@ on Wayland.
 
 - Fullscreen windows bypass X11 struts by design — the widget stays behind them.
 - Kitty remote focus requires `allow_remote_control yes` + `listen_on` in `kitty.conf`.
-- Sessions running an old Claude Code (no `~/.claude/sessions/<pid>.json`) fall
-  back to coarser transcript-based state.
+- Current Claude Code no longer writes `~/.claude/sessions/<pid>.json`, so all
+  sessions use the coarser transcript-based state. The registry path is kept for
+  older sessions that still write it.
+- Transcript state can't distinguish a tool that is *executing* from one
+  *awaiting permission approval* — both end in an `assistant` `tool_use` and show
+  as **working**. A permission-blocked session therefore won't light up
+  **waiting** (orange); the registry used to flag this distinctly.
 - The registry format is first-party but undocumented — its `status` enum may
   change between Claude versions (the transcript fallback covers that case).
-- JSONL slug resolution (fallback path only): `cwd` → replace non-alphanum with
-  `-` → match under `~/.claude/projects/`. The registry's `sessionId` bypasses
-  this on the primary path.
+- JSONL slug resolution (transcript path): `cwd` → replace non-alphanum with
+  `-` → match under `~/.claude/projects/`. The registry's `sessionId`, when a
+  registry file exists, bypasses this guessing.
