@@ -718,20 +718,27 @@ def get_session_info_from_jsonl(
     return result
 
 
-def get_session_registry(pid: int, starttime: int) -> dict | None:
-    """Registre de session première-partie écrit par Claude : ~/.claude/sessions/<pid>.json.
+def get_session_registry(pid: int, starttime: int,
+                         config_dir: str | None = None) -> dict | None:
+    """Registre de session première-partie écrit par Claude : <config>/sessions/<pid>.json.
 
     C'est la source d'état primaire — Claude y maintient en temps réel un champ
     `status` (busy/shell/compacting/waiting/idle) ainsi que `sessionId` et `cwd`.
     Indépendant du terminal (marche sous Wayland) et du système de hooks.
+
+    Le registre vit sous le CLAUDE_CONFIG_DIR de l'instance : une session lancée
+    avec un config dir custom écrit dans <config_dir>/sessions/, PAS dans
+    ~/.claude/sessions/. Le chercher au mauvais endroit le rend introuvable et
+    fait retomber (à tort) sur le fallback JSONL.
 
     Garde anti-recyclage de PID : `procStart` (ticks de démarrage du process,
     champ 22 de /proc/<pid>/stat) doit correspondre au `starttime` du process
     courant ; sinon le fichier provient d'une session précédente ayant porté le
     même PID → ignoré. Retourne le dict, ou None si absent/illisible/périmé.
     """
+    sessions_dir = (Path(config_dir) / 'sessions') if config_dir else _SESSIONS_DIR
     try:
-        data = json.loads((_SESSIONS_DIR / f'{pid}.json').read_text())
+        data = json.loads((sessions_dir / f'{pid}.json').read_text())
     except (OSError, ValueError):
         return None
     ps = data.get('procStart')
@@ -757,7 +764,7 @@ def get_session_state(pid: int, cwd: str | None,
     `sessionId` du registre, quand il existe, donne le chemin EXACT du JSONL ;
     sinon on devine par slug du cwd.
     """
-    reg = get_session_registry(pid, starttime)
+    reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get('sessionId') if reg else None
     if reg and not cwd:
         cwd = reg.get('cwd')
@@ -890,6 +897,14 @@ def scan_sessions() -> list[dict]:
             window_id = find_best_window(term_pid, cwd, all_windows)
 
         config_dir = env.get('CLAUDE_CONFIG_DIR') or None
+        if config_dir:
+            # CLAUDE_CONFIG_DIR hérité de l'env de la session : on résout `~`
+            # (quoté → non-expansé par le shell) et on rejette tout chemin
+            # relatif (sans cwd de la session, il pointerait sur le cwd du
+            # watcher → registre/JSONL/watch au mauvais endroit). → défaut.
+            config_dir = os.path.expanduser(config_dir)
+            if not os.path.isabs(config_dir):
+                config_dir = None
         state, context_pct, tool = get_session_state(
             pid, cwd, p['starttime'], config_dir)
         sessions.append({
@@ -1483,10 +1498,10 @@ class ClaudeWatcher(Gtk.Window):
         self.connect('button-release-event', self._on_drag_release)
         self.connect('button-press-event',   self._on_window_press)
         self.connect('scroll-event',         self._on_scroll)
+        self._setup_status_monitor()
         self._refresh()
         self._refresh_timer_id = GLib.timeout_add(cfg.refresh_ms, self._refresh)
         GLib.timeout_add(600, self._tick_anim)
-        self._setup_status_monitor()
         self._check_latest_version_async()
         GLib.timeout_add_seconds(6 * 3600, self._recheck_version_tick)
 
@@ -2387,17 +2402,38 @@ class ClaudeWatcher(Gtk.Window):
     # ── Refresh ───────────────────────────────────────────────────────────────
 
     def _setup_status_monitor(self):
-        """inotify sur ~/.claude/sessions/ via Gio — refresh immédiat.
+        """inotify (Gio) sur les dossiers sessions/ — refresh immédiat.
 
-        Claude réécrit <pid>.json à chaque changement d'état : on rafraîchit
-        dès qu'un de ces fichiers bouge, sans attendre le tick de polling.
+        Claude réécrit <config>/sessions/<pid>.json à chaque changement d'état :
+        on rafraîchit dès qu'un fichier bouge, sans attendre le tick de polling.
+        Le dossier par défaut est surveillé d'emblée ; les CLAUDE_CONFIG_DIR
+        custom sont ajoutés dynamiquement à mesure que le scan les expose
+        (_sync_status_monitors), un monitor Gio par dossier.
         """
+        self._status_monitors: dict[str, Gio.FileMonitor] = {}
         _SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        gio_dir = Gio.File.new_for_path(str(_SESSIONS_DIR))
-        self._status_monitor = gio_dir.monitor_directory(
-            Gio.FileMonitorFlags.NONE, None,
-        )
-        self._status_monitor.connect('changed', self._on_status_changed)
+        self._watch_status_dir(_SESSIONS_DIR)
+
+    def _watch_status_dir(self, path: Path) -> None:
+        """Arme un monitor Gio sur `path` (idempotent ; skip si dossier absent)."""
+        key = str(path)
+        if key in self._status_monitors or not path.is_dir():
+            return
+        try:
+            mon = Gio.File.new_for_path(key).monitor_directory(
+                Gio.FileMonitorFlags.NONE, None,
+            )
+        except Exception:
+            return
+        mon.connect('changed', self._on_status_changed)
+        self._status_monitors[key] = mon
+
+    def _sync_status_monitors(self) -> None:
+        """Surveille le sessions/ de chaque CLAUDE_CONFIG_DIR exposé par le scan."""
+        for s in self.sessions:
+            cfg = s.get('config_dir')
+            if cfg:
+                self._watch_status_dir(Path(cfg) / 'sessions')
 
     def _on_status_changed(self, _monitor, gfile, _other, event_type):
         if event_type in (Gio.FileMonitorEvent.CHANGED, Gio.FileMonitorEvent.CREATED):
@@ -2406,6 +2442,7 @@ class ClaudeWatcher(Gtk.Window):
 
     def _refresh(self):
         self.sessions = scan_sessions()
+        self._sync_status_monitors()
         self._rebuild_sessions()
         GLib.idle_add(self._reposition)
         return True
