@@ -833,6 +833,22 @@ def focus_terminal(window_id: str | None, terminal_pid: int | None,
                    kitty_window_id: str | None = None) -> bool:
     if IS_WAYLAND:
         return _focus_terminal_wayland(terminal_pid)
+
+    focused = False
+
+    # Bascule de workspace + activation de la fenêtre X11 (WINDOWID depuis l'env,
+    # ou meilleure fenêtre par titre). `wmctrl -ia` change de bureau virtuel pour
+    # atteindre la fenêtre — indispensable quand kitty est sur un autre workspace.
+    # On le fait AVANT le focus-window kitty : la commande remote de kitty
+    # sélectionne l'onglet à l'intérieur de kitty mais ne demande pas au WM de
+    # changer de bureau, donc seule kitty laissait le focus sur un autre workspace.
+    if window_id:
+        try:
+            subprocess.run(['wmctrl', '-ia', window_id], timeout=2)
+            focused = True
+        except Exception:
+            pass
+
     # Kitty remote control : désambiguïse quand plusieurs onglets partagent un wid.
     if kitty_socket and kitty_window_id:
         try:
@@ -842,16 +858,12 @@ def focus_terminal(window_id: str | None, terminal_pid: int | None,
                 capture_output=True, timeout=2,
             )
             if r.returncode == 0:
-                return True
+                focused = True
         except Exception:
             pass
-    # Fenêtre X11 exacte (WINDOWID depuis l'env, ou meilleure fenêtre par titre)
-    if window_id:
-        try:
-            subprocess.run(['wmctrl', '-ia', window_id], timeout=2)
-            return True
-        except Exception:
-            pass
+
+    if focused:
+        return True
     # Fallback xdotool sur le PID du terminal (terminaux XWayland ou X11 natifs)
     if terminal_pid:
         try:
