@@ -1,6 +1,8 @@
 [project]
 name = "claude-watcher-gtk"
-version = "1.0.0"
+# Placeholder: the real version is the git tag, stamped into the shipped
+# script + installer by the release workflow. Never hand-bumped here.
+version = "0.0.0"
 description = "GTK3 desktop widget that monitors running Claude Code sessions"
 requires-python = ">=3.10"
 dependencies = [
