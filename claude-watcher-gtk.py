@@ -150,6 +150,8 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
                    help="désactive l'icône systray.")
     p.add_argument('--list-screens', action='store_true',
                    help='liste les monitors détectés et quitte.')
+    p.add_argument('--dump', action='store_true',
+                   help="un tour de calcul d'état (registre vs JSONL vs final) en texte, puis quitte.")
     args = p.parse_args(argv)
     if (args.x is None) != (args.y is None):
         p.error('--x et --y doivent être fournis ensemble.')
@@ -2640,6 +2642,47 @@ class ClaudeWatcher(Gtk.Window):
 
 # ── Utilitaire ────────────────────────────────────────────────────────────────
 
+def dump_round():
+    """Un tour de calcul d'état en texte, sans UI ni dépendance display/Wnck.
+
+    Pour troubleshooter le classement working/waiting : montre les valeurs
+    intermédiaires (statut registre brut, état JSONL brut) à côté de l'état
+    final réconcilié — exactement ce que calcule `get_session_state`.
+    """
+    procs = get_claude_processes()
+    if not procs:
+        print('no claude session found')
+        return
+    for p in procs:
+        pid = p['pid']
+        cwd = get_cwd(pid)
+        env = get_env(pid)
+        config_dir = env.get('CLAUDE_CONFIG_DIR') or None
+        if config_dir:
+            config_dir = os.path.expanduser(config_dir)
+            if not os.path.isabs(config_dir):
+                config_dir = None
+        reg = get_session_registry(pid, p['starttime'], config_dir)
+        reg_status = reg.get('status') if reg else None
+        session_id = reg.get('sessionId') if reg else None
+        eff_cwd = cwd or (reg.get('cwd') if reg else None)
+        jsonl_state, ctx, tool, topic = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
+        # Source de vérité : même appel que l'app, pour que `state` colle au badge.
+        state, _, _, _ = get_session_state(pid, cwd, p['starttime'], config_dir)
+        reg_mapped = _STATUS_MAP.get(reg_status or '', 'idle') if reg else '(no registry)'
+        print(f"pid {pid}  {project_label(eff_cwd)}  ({format_elapsed(p['elapsed'])})")
+        print(f"  cwd          {eff_cwd or '?'}")
+        print(f"  config_dir   {display_config_dir(config_dir) or '(default)'}")
+        print(f"  session_id   {session_id or '(none)'}")
+        print(f"  reg.status   {reg_status!r} -> {reg_mapped}")
+        print(f"  jsonl_state  {jsonl_state!r}")
+        print(f"  => state     {state}{'  (reconciled from registry)' if reg and reg_mapped != state else ''}")
+        print(f"  context_pct  {ctx}")
+        print(f"  tool         {tool}")
+        print(f"  topic        {topic}")
+        print()
+
+
 def list_screens():
     display = Gdk.Display.get_default()
     for i in range(display.get_n_monitors()):
@@ -2655,6 +2698,9 @@ def main():
     global CFG
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     CFG = parse_args(load_config())
+    if CFG.dump:
+        dump_round()
+        return
     if CFG.list_screens:
         list_screens()
         return
