@@ -119,6 +119,7 @@ def load_config() -> dict:
         'margin_y':   int(d.get('margin_y',   35)),
         'width':      int(d.get('width',      320)),
         'auto_width': d.get('auto_width', 'false').lower() == 'true',
+        'show_topic': f.get('show_topic', 'true').lower() == 'true',
         'refresh_ms': int(d.get('refresh_ms', 2000)),
         'snooze_sec': int(d.get('snooze_sec', 30)),
         'bg_alpha':   _parse_bg_alpha(d.get('bg_alpha', BG_ALPHA_DEFAULT)),
@@ -157,6 +158,7 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
     args.mode       = defaults['mode']
     args.width      = defaults['width']
     args.auto_width = defaults['auto_width']
+    args.show_topic = defaults['show_topic']
     args.refresh_ms = defaults['refresh_ms']
     args.snooze_sec        = defaults['snooze_sec']
     args.bg_alpha          = defaults['bg_alpha']
@@ -224,6 +226,7 @@ STRINGS = {
         'fld_margin_y':   'Marge Y',
         'fld_width':      'Largeur (max si auto)',
         'fld_auto_width': 'Largeur automatique',
+        'fld_show_topic': 'Afficher le sujet de session',
         'fld_refresh':    'Rafraîch.',
         'fld_snooze':     'Veille',
         'fld_bg_alpha':   'Opacité',
@@ -292,6 +295,7 @@ STRINGS = {
         'fld_margin_y':   'Margin Y',
         'fld_width':      'Width (max if auto)',
         'fld_auto_width': 'Auto width',
+        'fld_show_topic': 'Show session topic',
         'fld_refresh':    'Refresh',
         'fld_snooze':     'Snooze',
         'fld_bg_alpha':   'Opacity',
@@ -599,6 +603,60 @@ def _read_tail_lines(path: Path, max_bytes: int) -> tuple[list[str], bool]:
     return lines, start == 0
 
 
+# Topic de session : `ai-title` (aiTitle, généré par Claude) écrit une fois tôt
+# dans le JSONL puis rarement régénéré ; `last-prompt` (lastPrompt) est appendé à
+# chaque tour. Le tail-read de l'état ne les voit pas (titre hors des derniers Ko).
+# Cache dédié {path: (offset_dernière_ligne_complète, title, lastPrompt)} : scan
+# complet au 1er passage, puis relecture du seul delta appendé. L'offset mémorisé
+# tombe toujours sur une frontière de ligne → pas de 1re ligne à jeter.
+_TOPIC_CACHE: dict[str, tuple[int, str | None, str | None]] = {}
+
+
+def _read_topic(path: Path) -> tuple[str | None, str | None]:
+    """(aiTitle, lastPrompt) du JSONL, en ne relisant que les octets ajoutés."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None, None
+    title = last_prompt = None
+    start = 0
+    cached = _TOPIC_CACHE.get(str(path))
+    if cached:
+        prev, title, last_prompt = cached
+        if size == prev:
+            return title, last_prompt
+        if size > prev:
+            start = prev          # delta uniquement (start = frontière de ligne)
+        else:
+            # size < prev → fichier tronqué/rotaté → rescan complet depuis 0 ;
+            # on repart de zéro (titre potentiellement disparu → pas de valeur périmée).
+            title = last_prompt = None
+    try:
+        with path.open('rb') as f:
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return title, last_prompt
+    nl = data.rfind(b'\n')
+    if nl == -1:                  # aucune ligne complète dans le delta
+        return title, last_prompt
+    for line in data[:nl + 1].decode(errors='ignore').split('\n'):
+        if '"ai-title"' not in line and '"last-prompt"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+        except Exception:
+            continue
+        if ev.get('type') == 'ai-title' and ev.get('aiTitle'):
+            title = ev['aiTitle']
+        elif ev.get('type') == 'last-prompt' and ev.get('lastPrompt'):
+            last_prompt = ev['lastPrompt']
+    if len(_TOPIC_CACHE) > 200:
+        _TOPIC_CACHE.clear()
+    _TOPIC_CACHE[str(path)] = (start + nl + 1, title, last_prompt)
+    return title, last_prompt
+
+
 def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str | None]:
     """Parse bottom-up : (state, context_pct, tool).
 
@@ -662,13 +720,14 @@ def get_session_info_from_jsonl(
     cwd: str | None,
     config_dir: str | None = None,
     session_id: str | None = None,
-) -> tuple[str | None, int | None, str | None]:
-    """État + % de contexte + outil courant depuis le JSONL de la session.
+) -> tuple[str | None, int | None, str | None, str | None]:
+    """État + % de contexte + outil courant + topic depuis le JSONL de la session.
 
-    Retourne (state, context_pct, tool) :
+    Retourne (state, context_pct, tool, topic) :
       state      : 'waiting' | 'working' | 'idle' | None (fallback registre absent)
       context_pct: 0-100 (% du contexte utilisé) | None si indisponible
       tool       : nom de l'outil courant | None
+      topic      : titre IA de la session, sinon dernier prompt | None
 
     Si `session_id` est fourni, cible directement <session_id>.jsonl (chemin
     exact donné par le registre, aucun devinage) ; sinon retombe sur le .jsonl
@@ -677,7 +736,7 @@ def get_session_info_from_jsonl(
     """
     project_dir = cwd_to_project_dir(cwd, config_dir)
     if not project_dir:
-        return None, None, None
+        return None, None, None, None
     latest = None
     if session_id:
         cand = project_dir / f'{session_id}.jsonl'
@@ -686,36 +745,43 @@ def get_session_info_from_jsonl(
     if latest is None:
         jsonl_files = [f for f in project_dir.glob('*.jsonl') if f.is_file()]
         if not jsonl_files:
-            return None, None, None
+            return None, None, None, None
         try:
             latest, _ = max(
                 ((f, f.stat().st_mtime) for f in jsonl_files),
                 key=lambda x: x[1],
             )
         except (OSError, ValueError):
-            return None, None, None
+            return None, None, None, None
     try:
         mtime = latest.stat().st_mtime
     except OSError:
-        return None, None, None
+        return None, None, None, None
     key = str(latest)
     cached = _JSONL_CACHE.get(key)
     if cached and cached[0] == mtime:
-        return cached[1]
-
-    result: tuple[str | None, int | None, str | None] = (None, None, None)
-    try:
-        lines, complete = _read_tail_lines(latest, _JSONL_TAIL_BYTES)
-        result = _parse_session_lines(lines)
-        # Tail tronqué et incomplet (état ou pct manquant) → relecture complète.
-        if not complete and (result[0] is None or result[1] is None):
-            result = _parse_session_lines(latest.read_text(errors='ignore').split('\n'))
-    except Exception:
-        pass
-    if len(_JSONL_CACHE) > 200:
-        _JSONL_CACHE.clear()
-    _JSONL_CACHE[key] = (mtime, result)
-    return result
+        result = cached[1]
+    else:
+        result = (None, None, None)
+        try:
+            lines, complete = _read_tail_lines(latest, _JSONL_TAIL_BYTES)
+            result = _parse_session_lines(lines)
+            # Tail tronqué et incomplet (état ou pct manquant) → relecture complète.
+            if not complete and (result[0] is None or result[1] is None):
+                result = _parse_session_lines(latest.read_text(errors='ignore').split('\n'))
+        except Exception:
+            pass
+        if len(_JSONL_CACHE) > 200:
+            _JSONL_CACHE.clear()
+        _JSONL_CACHE[key] = (mtime, result)
+    # Topic désactivable (features.show_topic) : si off, on saute carrément la
+    # lecture du JSONL pour le titre → aucun coût I/O quand la feature est éteinte.
+    if getattr(CFG, 'show_topic', True):
+        title, last_prompt = _read_topic(latest)
+        topic = title or last_prompt
+    else:
+        topic = None
+    return result[0], result[1], result[2], topic
 
 
 def get_session_registry(pid: int, starttime: int,
@@ -753,8 +819,8 @@ def get_session_registry(pid: int, starttime: int,
 
 def get_session_state(pid: int, cwd: str | None,
                       starttime: int = 0,
-                      config_dir: str | None = None) -> tuple[str, int | None, str | None]:
-    """État de la session. Retourne (state, context_pct, tool_name).
+                      config_dir: str | None = None) -> tuple[str, int | None, str | None, str | None]:
+    """État de la session. Retourne (state, context_pct, tool_name, topic).
 
     Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) est
     prioritaire quand il existe ; selon la version de Claude Code il peut être
@@ -768,7 +834,7 @@ def get_session_state(pid: int, cwd: str | None,
     session_id = reg.get('sessionId') if reg else None
     if reg and not cwd:
         cwd = reg.get('cwd')
-    jsonl_state, context_pct, tool = get_session_info_from_jsonl(cwd, config_dir, session_id)
+    jsonl_state, context_pct, tool, topic = get_session_info_from_jsonl(cwd, config_dir, session_id)
     if reg:
         status = reg.get('status', '')
         state = _STATUS_MAP.get(status, 'idle')
@@ -784,7 +850,7 @@ def get_session_state(pid: int, cwd: str | None,
             state = jsonl_state
     else:
         state = jsonl_state or 'idle'
-    return state, context_pct, tool
+    return state, context_pct, tool, topic
 
 
 def format_elapsed(s) -> str:
@@ -928,11 +994,12 @@ def scan_sessions() -> list[dict]:
             config_dir = os.path.expanduser(config_dir)
             if not os.path.isabs(config_dir):
                 config_dir = None
-        state, context_pct, tool = get_session_state(
+        state, context_pct, tool, topic = get_session_state(
             pid, cwd, p['starttime'], config_dir)
         sessions.append({
             'pid':             pid,
             'project':         project_label(cwd),
+            'topic':           topic,
             'cwd':             cwd or '?',
             'elapsed':         p['elapsed'],
             'waiting':         state == 'waiting',
@@ -958,9 +1025,13 @@ class SessionRow(Gtk.EventBox):
         self._hovered     = False
         self._kb_selected = False
 
-        # Survol : chemin de travail complet (le label n'affiche que les 2
-        # derniers segments, tronqués au besoin).
-        self.set_tooltip_text(session['cwd'])
+        # Survol : chemin de travail complet + sujet complet (les labels tronquent
+        # — projet aux 2 derniers segments, sujet à la 1re ligne ellipsée).
+        tip = session['cwd']
+        topic = (session.get('topic') or '').strip()
+        if topic:
+            tip = f'{tip}\n\nTopic: {topic}'
+        self.set_tooltip_text(tip)
         self.set_visible_window(True)
         self.connect('button-press-event', self._on_click)
         self.connect('enter-notify-event',  self._on_enter)
@@ -984,13 +1055,33 @@ class SessionRow(Gtk.EventBox):
 
         info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
         info.set_valign(Gtk.Align.CENTER)
+        # halign FILL + hexpand + xalign 0 : le label occupe toute la largeur dispo
+        # de la ligne et n'ellipse qu'au bord réel du widget (s'adapte à la largeur
+        # configurée / auto). max_width_chars ne sert que de garde-fou en mode
+        # auto_width (borne la largeur naturelle réclamée).
         self.lbl_project = Gtk.Label()
-        self.lbl_project.set_halign(Gtk.Align.START)
+        self.lbl_project.set_halign(Gtk.Align.FILL)
+        self.lbl_project.set_xalign(0.0)
+        self.lbl_project.set_hexpand(True)
         self.lbl_project.set_ellipsize(Pango.EllipsizeMode.END)
-        self.lbl_project.set_max_width_chars(24)
+        self.lbl_project.set_max_width_chars(40)
+        # Topic IA : distingue plusieurs sessions partageant le même cwd.
+        self.lbl_topic = Gtk.Label()
+        self.lbl_topic.set_halign(Gtk.Align.FILL)
+        self.lbl_topic.set_xalign(0.0)
+        self.lbl_topic.set_hexpand(True)
+        self.lbl_topic.set_ellipsize(Pango.EllipsizeMode.END)
+        self.lbl_topic.set_max_width_chars(48)
+        self.lbl_topic.set_no_show_all(True)  # masqué si pas de topic, sans gap
+        # Ellipsize ici aussi : sans ça la ligne meta (non tronquable) impose la
+        # largeur minimale de la fenêtre et empêche de descendre sous ~200 px.
         self.lbl_meta = Gtk.Label()
-        self.lbl_meta.set_halign(Gtk.Align.START)
+        self.lbl_meta.set_halign(Gtk.Align.FILL)
+        self.lbl_meta.set_xalign(0.0)
+        self.lbl_meta.set_ellipsize(Pango.EllipsizeMode.END)
+        self.lbl_meta.set_max_width_chars(40)
         info.pack_start(self.lbl_project, False, False, 0)
+        info.pack_start(self.lbl_topic,   False, False, 0)
         info.pack_start(self.lbl_meta,    False, False, 0)
         box.pack_start(info, True, True, 0)
 
@@ -1022,6 +1113,15 @@ class SessionRow(Gtk.EventBox):
             f'<span foreground="{TEXT_PRIMARY}" font="Monospace 9" weight="500">'
             f'{GLib.markup_escape_text(s["project"])}</span>'
         )
+        topic = (s.get('topic') or '').strip().split('\n', 1)[0]
+        if topic:
+            self.lbl_topic.set_markup(
+                f'<span foreground="{TEXT_DIM2}" font="Monospace 8" style="italic">'
+                f'{GLib.markup_escape_text(topic)}</span>'
+            )
+            self.lbl_topic.set_visible(True)
+        else:
+            self.lbl_topic.set_visible(False)
         ctx = s.get('context_pct')
         if ctx is not None:
             if ctx >= 80:   ctx_color = '#e86c3a'
@@ -1127,6 +1227,7 @@ class SettingsDialog(Gtk.Dialog):
             'margin_y':   CFG.margin_y,
             'width':      CFG.width,
             'auto_width': CFG.auto_width,
+            'show_topic': getattr(CFG, 'show_topic', True),
             'refresh_ms': CFG.refresh_ms,
             'snooze_sec': CFG.snooze_sec,
             # Effective on-screen value, not CFG: shift+scroll moves it away
@@ -1261,6 +1362,10 @@ class SettingsDialog(Gtk.Dialog):
         self._chk_auto_width.set_active(CFG.auto_width)
         g2.attach(self._chk_auto_width, 0, 0, 3, 1)
 
+        self._chk_show_topic = Gtk.CheckButton(label=tr('fld_show_topic'))
+        self._chk_show_topic.set_active(getattr(CFG, 'show_topic', True))
+        g2.attach(self._chk_show_topic, 0, 5, 3, 1)
+
         self._lbl_width = field_label(tr('fld_width'))
         g2.attach(self._lbl_width, 0, 1, 1, 1)
         self._spin_width = Gtk.SpinButton.new_with_range(200, 800, 10)
@@ -1322,6 +1427,7 @@ class SettingsDialog(Gtk.Dialog):
             (self._spin_my,       'value-changed'),
             (self._spin_width,    'value-changed'),
             (self._chk_auto_width,'toggled'),
+            (self._chk_show_topic,'toggled'),
             (self._spin_bg_alpha, 'value-changed'),
         ]:
             widget.connect(signal, self._on_preview_change)
@@ -1355,6 +1461,7 @@ class SettingsDialog(Gtk.Dialog):
             'margin_y':   int(self._spin_my.get_value()),
             'width':      int(self._spin_width.get_value()),
             'auto_width': self._chk_auto_width.get_active(),
+            'show_topic': self._chk_show_topic.get_active(),
             'refresh_ms': int(self._spin_refresh.get_value()),
             'snooze_sec': int(self._spin_snooze.get_value()),
             'bg_alpha':   int(self._spin_bg_alpha.get_value()),
@@ -2047,6 +2154,7 @@ class ClaudeWatcher(Gtk.Window):
         CFG.corner   = values['corner']
         CFG.margin_x = values['margin_x']
         CFG.margin_y = values['margin_y']
+        CFG.show_topic = values['show_topic']  # lu par get_session_info_from_jsonl au _refresh()
         if values['bg_alpha'] != round(self._effective_alpha() * 100):
             self._set_effective_alpha(values['bg_alpha'] / 100.0)
         # _compute_xy lit les attributs d'instance, pas CFG — garder en sync
@@ -2097,6 +2205,7 @@ class ClaudeWatcher(Gtk.Window):
         cfg_file['general']['lang']       = values['lang']
         cfg_file['general']['hotkey']     = values['hotkey']
         cfg_file['features']['shortcut_enable'] = 'true' if values['shortcut_enable'] else 'false'
+        cfg_file['features']['show_topic'] = 'true' if values['show_topic'] else 'false'
         cfg_file['display']['mode']       = 'free' if values['free'] else 'corner'
         cfg_file['display']['screen']     = str(values['screen'])
         cfg_file['display']['corner']     = values['corner']
