@@ -17,6 +17,7 @@ Un widget de bureau GTK3 pour Ubuntu qui surveille toutes les sessions Claude Co
 - Clic molette pour snoozer/réveiller (estompe le widget pendant une durée configurable)
 - **Maj + molette** pour ajuster l'opacité en direct
 - Molette sur la barre de titre — ou le chevron ▾/▸ — pour enrouler/dérouler le widget
+- Disposition multi-colonnes pour de nombreuses sessions, avec hauteur max configurable et barre de défilement au-delà
 - Raccourci clavier global configurable (défaut `<Ctrl><Alt>q`) pour lancer la navigation clavier
 - Drag de l'en-tête ou du pied pour repositionner librement — la position est mémorisée
 - Icône systray avec indicateur d'état global

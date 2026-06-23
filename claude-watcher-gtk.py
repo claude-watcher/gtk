@@ -119,6 +119,11 @@ def load_config() -> dict:
         'margin_y':   int(d.get('margin_y',   35)),
         'width':      int(d.get('width',      320)),
         'auto_width': d.get('auto_width', 'false').lower() == 'true',
+        # Multi-colonnes (1 par défaut) + plafond de hauteur (0/vide = pas de
+        # limite propre, l'écran borne de toute façon). `int(x or N)` tolère la
+        # clé absente (None) comme la valeur vide ('').
+        'columns':    max(1, int(d.get('columns') or 1)),
+        'max_height': max(0, int(d.get('max_height') or 0)),
         'show_topic': f.get('show_topic', 'true').lower() == 'true',
         'refresh_ms': int(d.get('refresh_ms', 2000)),
         'snooze_sec': int(d.get('snooze_sec', 30)),
@@ -160,6 +165,8 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
     args.mode       = defaults['mode']
     args.width      = defaults['width']
     args.auto_width = defaults['auto_width']
+    args.columns    = defaults['columns']
+    args.max_height = defaults['max_height']
     args.show_topic = defaults['show_topic']
     args.refresh_ms = defaults['refresh_ms']
     args.snooze_sec        = defaults['snooze_sec']
@@ -228,6 +235,12 @@ STRINGS = {
         'fld_margin_y':   'Marge Y',
         'fld_width':      'Largeur (max si auto)',
         'fld_auto_width': 'Largeur automatique',
+        'fld_columns':    'Colonnes',
+        'fld_max_height': 'Hauteur max',
+        'help_max_height': ('0 = aucune limite : la hauteur du widget est de toute '
+                            'façon toujours bornée par la taille de l’écran. '
+                            'Une valeur > 0 plafonne en plus à ce nombre de pixels ; '
+                            'au-delà, la liste des sessions défile.'),
         'fld_show_topic': 'Afficher le sujet de session',
         'fld_refresh':    'Rafraîch.',
         'fld_snooze':     'Veille',
@@ -297,6 +310,11 @@ STRINGS = {
         'fld_margin_y':   'Margin Y',
         'fld_width':      'Width (max if auto)',
         'fld_auto_width': 'Auto width',
+        'fld_columns':    'Columns',
+        'fld_max_height': 'Max height',
+        'help_max_height': ('0 = no limit: the widget height is always capped by '
+                            'the screen size anyway. A value > 0 additionally caps '
+                            'it to that many pixels; beyond it, the session list scrolls.'),
         'fld_show_topic': 'Show session topic',
         'fld_refresh':    'Refresh',
         'fld_snooze':     'Snooze',
@@ -323,6 +341,7 @@ def tr(key: str) -> str:
 
 BG_RGB           = (0.07, 0.07, 0.09)  # alpha comes from bg_alpha (config, %)
 BG_ALPHA_DEFAULT = 88                  # default background opacity, in %
+COL_SPACING      = 14                  # px gutter between columns (holds the vertical separator)
 TEXT_PRIMARY  = "#e2e2e2"
 TEXT_DIM      = "#55556a"
 TEXT_DIM2     = "#888898"
@@ -1102,6 +1121,23 @@ class SessionRow(Gtk.EventBox):
         self._update_labels()
         self.show_all()
 
+    def update_session(self, session: dict):
+        """Met à jour la ligne EN PLACE (pas de recréation).
+
+        Réécrit tooltip + labels + couleur du point depuis la nouvelle session,
+        sans détruire le widget : l'état de survol (hover) et la sélection clavier
+        sont préservés, et l'anim de pulse n'est pas réinitialisée. Appelé par
+        _rebuild_sessions quand la structure (pids/colonnes) est inchangée.
+        """
+        self.session = session
+        tip = session['cwd']
+        topic = (session.get('topic') or '').strip()
+        if topic:
+            tip = f'{tip}\n\nTopic: {topic}'
+        self.set_tooltip_text(tip)
+        self._update_labels()
+        self.dot.queue_draw()
+
     def _update_labels(self):
         s = self.session
         if s['waiting']:
@@ -1229,6 +1265,8 @@ class SettingsDialog(Gtk.Dialog):
             'margin_y':   CFG.margin_y,
             'width':      CFG.width,
             'auto_width': CFG.auto_width,
+            'columns':    getattr(CFG, 'columns', 1),
+            'max_height': getattr(CFG, 'max_height', 0),
             'show_topic': getattr(CFG, 'show_topic', True),
             'refresh_ms': CFG.refresh_ms,
             'snooze_sec': CFG.snooze_sec,
@@ -1399,6 +1437,29 @@ class SettingsDialog(Gtk.Dialog):
             'clicked', lambda _b: self._spin_bg_alpha.set_value(BG_ALPHA_DEFAULT))
         g2.attach(btn_bg_default, 3, 4, 1, 1)
 
+        g2.attach(field_label(tr('fld_columns')), 0, 6, 1, 1)
+        self._spin_columns = Gtk.SpinButton.new_with_range(1, 6, 1)
+        self._spin_columns.set_value(getattr(CFG, 'columns', 1))
+        g2.attach(self._spin_columns, 1, 6, 1, 1)
+
+        # Label « Hauteur max » + icône info (tooltip explicatif au survol) plutôt
+        # qu'un « (0 = écran) » accolé : plus lisible, l'explication complète tient
+        # dans le tooltip.
+        mh_lbl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        mh_lbl_box.set_halign(Gtk.Align.END)
+        mh_lbl_box.set_valign(Gtk.Align.CENTER)
+        mh_lbl = Gtk.Label(label=tr('fld_max_height'))
+        mh_info = Gtk.Image.new_from_icon_name('dialog-information-symbolic', Gtk.IconSize.MENU)
+        mh_info.set_tooltip_text(tr('help_max_height'))
+        mh_lbl_box.pack_start(mh_lbl,  False, False, 0)
+        mh_lbl_box.pack_start(mh_info, False, False, 0)
+        g2.attach(mh_lbl_box, 0, 7, 1, 1)
+        # 0 = pas de limite propre (l'écran borne) ; pas-50 px ; plafond large.
+        self._spin_max_height = Gtk.SpinButton.new_with_range(0, 4000, 50)
+        self._spin_max_height.set_value(getattr(CFG, 'max_height', 0))
+        g2.attach(self._spin_max_height, 1, 7, 1, 1)
+        g2.attach(Gtk.Label(label="px"), 2, 7, 1, 1)
+
         # ── Raccourci clavier ────────────────────────────────────────────────
         outer.pack_start(Gtk.Separator(), False, False, 0)
         outer.pack_start(section_label(tr('sec_shortcut')), False, False, 0)
@@ -1431,6 +1492,8 @@ class SettingsDialog(Gtk.Dialog):
             (self._chk_auto_width,'toggled'),
             (self._chk_show_topic,'toggled'),
             (self._spin_bg_alpha, 'value-changed'),
+            (self._spin_columns,    'value-changed'),
+            (self._spin_max_height, 'value-changed'),
         ]:
             widget.connect(signal, self._on_preview_change)
 
@@ -1463,6 +1526,8 @@ class SettingsDialog(Gtk.Dialog):
             'margin_y':   int(self._spin_my.get_value()),
             'width':      int(self._spin_width.get_value()),
             'auto_width': self._chk_auto_width.get_active(),
+            'columns':    int(self._spin_columns.get_value()),
+            'max_height': int(self._spin_max_height.get_value()),
             'show_topic': self._chk_show_topic.get_active(),
             'refresh_ms': int(self._spin_refresh.get_value()),
             'snooze_sec': int(self._spin_snooze.get_value()),
@@ -1480,6 +1545,9 @@ class ClaudeWatcher(Gtk.Window):
         # Layer shell nécessite TOPLEVEL ; POPUP pour X11 (no-decoration natif).
         super().__init__(type=Gtk.WindowType.TOPLEVEL if IS_WAYLAND else Gtk.WindowType.POPUP)
         self.sessions      = []
+        self._session_rows = []   # SessionRow ordonnées (nav clavier + anim)
+        self._last_size    = None # dernière taille (w, h) appliquée — anti-churn resize
+        self._last_rows_sig = None # structure des lignes (cols, pids) au dernier rebuild
         self._anim_tick    = 0
         self._snooze_until = 0
         self._snooze_timer = None
@@ -1518,7 +1586,12 @@ class ClaudeWatcher(Gtk.Window):
         # ── Fenêtre ─────────────────────────────────────────────────────────
         self.set_title("Claude Code Watcher")
         self.set_decorated(False)
-        self.set_resizable(False)
+        # Redimensionnable au sens GTK pour que NOS geometry hints (largeur fixée
+        # à w dans _apply_window_size) fassent autorité : set_resizable(False)
+        # forcerait min = max = largeur NATURELLE, qui gonfle avec les compteurs
+        # d'en-tête et fait sortir la fenêtre de l'écran. Sans décoration ni entrée
+        # de barre des tâches, l'utilisateur ne peut de toute façon pas la redimensionner.
+        self.set_resizable(True)
         self.set_skip_taskbar_hint(True)
         self.set_skip_pager_hint(True)
         if not IS_WAYLAND:
@@ -1566,6 +1639,11 @@ class ClaudeWatcher(Gtk.Window):
 
         self.lbl_counts = Gtk.Label()
         self.lbl_counts.set_halign(Gtk.Align.END)
+        # Ellipsable : sans ça, des compteurs longs (« 1 attente · 1 travaille ·
+        # 2 total ») donnent à l'en-tête une largeur naturelle > largeur épinglée,
+        # ce qui élargit la fenêtre hors écran. Avec les geometry hints fixant la
+        # largeur (_apply_window_size), le compteur s'ellipse plutôt que déborder.
+        self.lbl_counts.set_ellipsize(Pango.EllipsizeMode.END)
         header.pack_start(self.lbl_counts, False, False, 0)
 
         # Header draggable + wheel shade
@@ -1578,10 +1656,41 @@ class ClaudeWatcher(Gtk.Window):
         sep_top = self._sep()
         self.main_box.pack_start(sep_top, False, False, 0)
 
-        self.sessions_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        self.main_box.pack_start(self.sessions_box, False, False, 0)
+        # Conteneur des sessions : une grille (multi-colonnes, CFG.columns) dans
+        # une zone scrollable bornée en hauteur. La grille répartit les lignes en
+        # colonnes ; le ScrolledWindow plafonne la hauteur (CFG.max_height, borné
+        # par l'écran) et fait apparaître une barre de défilement quand il y a
+        # trop de sessions pour tenir verticalement.
+        self.sessions_box = Gtk.Grid()
+        self.sessions_box.set_column_homogeneous(True)
+        # Gouttière entre colonnes + trait vertical dessiné dedans (multi-colonnes).
+        self.sessions_box.set_column_spacing(COL_SPACING)
+        self.sessions_box.connect_after('draw', self._draw_col_seps)
+
+        self.sessions_scroll = Gtk.ScrolledWindow()
+        self.sessions_scroll.set_name('sessions-scroll')
+        self.sessions_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.sessions_scroll.set_shadow_type(Gtk.ShadowType.NONE)
+        # La zone réclame sa hauteur naturelle (jusqu'au plafond) pour suivre le
+        # nombre de sessions. La largeur naturelle, elle, n'est propagée qu'en
+        # mode auto-width (géré dans _apply_window_size) — la propager en largeur
+        # fixe ferait déborder la fenêtre hors écran sous policy NEVER.
+        self.sessions_scroll.set_propagate_natural_height(True)
+        self.sessions_scroll.add(self.sessions_box)
+        self.main_box.pack_start(self.sessions_scroll, False, False, 0)
         sep_bottom = self._sep()
         self.main_box.pack_start(sep_bottom, False, False, 0)
+
+        # Le ScrolledWindow interpose un Viewport qui peindrait le fond opaque du
+        # thème par-dessus notre fond arrondi semi-transparent : on le force en
+        # transparent (ciblé par #sessions-scroll pour ne pas toucher d'autres vues).
+        _scroll_css = Gtk.CssProvider()
+        _scroll_css.load_from_data(
+            b'#sessions-scroll, #sessions-scroll viewport '
+            b'{ background-color: transparent; background-image: none; }')
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), _scroll_css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         footer.set_margin_start(8)
@@ -1611,15 +1720,15 @@ class ClaudeWatcher(Gtk.Window):
 
         # Shade (roll-up): everything below the header can be collapsed
         self._rolled = False
-        self._roll_widgets = [sep_top, self.sessions_box, sep_bottom, footer_evt]
+        self._roll_widgets = [sep_top, self.sessions_scroll, sep_bottom, footer_evt]
         self._update_chevron()
 
         # ── Init ────────────────────────────────────────────────────────────
         if cfg.auto_width:
             self.set_default_size(-1, -1)
         else:
-            self.set_default_size(cfg.width, -1)
-            self.set_size_request(cfg.width, -1)
+            self.set_default_size(self._window_width(), -1)
+        self._apply_window_size()
         self.connect('realize', self._on_realize)
         self.connect('enter-notify-event', self._on_enter_window)
         self.connect('leave-notify-event', self._on_leave_window)
@@ -1777,16 +1886,12 @@ class ClaudeWatcher(Gtk.Window):
                 w.hide()
             else:
                 w.show_all()
-        # Rolled: compact pill — drop the width pin and the header/footer
-        # padding so the window shrinks to the title's natural size.
+        # Rolled: compact pill — drop the header/footer padding so the window
+        # shrinks to the title's natural size. _apply_window_size gère la
+        # bascule des contraintes de taille (pilule ↔ largeur fixe + hauteur).
         self._header.set_margin_bottom(0 if rolled else 8)
         self.main_box.set_margin_bottom(12 if rolled else 15)
-        if rolled or CFG.auto_width:
-            self.set_size_request(-1, -1)
-            self.resize(1, 1)
-        else:
-            self.set_size_request(CFG.width, -1)
-            self.resize(CFG.width, 1)
+        self._apply_window_size()
         # Re-anchor: size changed, bottom/right corners must stay put
         GLib.idle_add(self._reposition)
 
@@ -1888,7 +1993,7 @@ class ClaudeWatcher(Gtk.Window):
                 pass
 
     def _on_keybinder_nav(self, keystring):
-        rows = [r for r in self.sessions_box.get_children() if isinstance(r, SessionRow)]
+        rows = self._session_rows
         if keystring == 'Up':
             self._kb_select(max(0, self._kb_index - 1))
         elif keystring == 'Down':
@@ -1916,8 +2021,7 @@ class ClaudeWatcher(Gtk.Window):
         self._refresh_kb_highlight()
 
     def _refresh_kb_highlight(self):
-        rows = [r for r in self.sessions_box.get_children() if isinstance(r, SessionRow)]
-        for i, row in enumerate(rows):
+        for i, row in enumerate(self._session_rows):
             row.set_kb_selected(i == self._kb_index)
 
     # ── Systray ───────────────────────────────────────────────────────────────
@@ -2165,21 +2269,14 @@ class ClaudeWatcher(Gtk.Window):
         self.margin_x = values['margin_x']
         self.margin_y = values['margin_y']
 
-        new_width = values['width']
-        new_auto  = values['auto_width']
-        if new_width != CFG.width or new_auto != CFG.auto_width:
-            CFG.width = new_width
-            CFG.auto_width = new_auto
-            # Rolled (shaded): don't re-pin the width — it would stretch the
-            # pill back to a full-width bar. _set_rolled(False) re-applies
-            # the (updated) CFG width on unroll.
-            if self._rolled:
-                pass
-            elif CFG.auto_width:
-                self.set_size_request(-1, -1)
-            else:
-                self.set_size_request(CFG.width, -1)
-                self.resize(CFG.width, 1)
+        CFG.width      = values['width']
+        CFG.auto_width = values['auto_width']
+        CFG.columns    = values['columns']
+        CFG.max_height = values['max_height']
+        # _apply_window_size recalcule largeur (colonnes × largeur) + plafond de
+        # hauteur scrollable, et respecte le mode roulé / largeur auto. Le
+        # ré-agencement des colonnes se fait dans le _refresh() final (lit CFG.columns).
+        self._apply_window_size()
 
         if values['free']:
             if self._user_pos is None:
@@ -2215,6 +2312,8 @@ class ClaudeWatcher(Gtk.Window):
         cfg_file['display']['margin_y']   = str(values['margin_y'])
         cfg_file['display']['width']      = str(values['width'])
         cfg_file['display']['auto_width'] = 'true' if values['auto_width'] else 'false'
+        cfg_file['display']['columns']    = str(values['columns'])
+        cfg_file['display']['max_height'] = str(values['max_height'])
         cfg_file['display']['refresh_ms'] = str(values['refresh_ms'])
         cfg_file['display']['snooze_sec'] = str(values['snooze_sec'])
         cfg_file['display']['bg_alpha']   = str(values['bg_alpha'])
@@ -2333,6 +2432,28 @@ class ClaudeWatcher(Gtk.Window):
         ))
         return sep
 
+    def _draw_col_seps(self, widget, cr):
+        """Trait vertical au milieu de chaque gouttière inter-colonnes.
+
+        Dessiné en connect_after (par-dessus les lignes déjà rendues) plutôt
+        qu'avec des colonnes de séparateurs : ça préserve les colonnes homogènes
+        et l'indexation row-major (i % cols) de _rebuild_sessions.
+        """
+        cols = self._effective_cols()
+        if cols < 2:
+            return False
+        w = widget.get_allocated_width()
+        h = widget.get_allocated_height()
+        s = self.sessions_box.get_column_spacing()
+        colw = (w - s * (cols - 1)) / cols   # largeur d'une colonne (homogène)
+        cr.set_source_rgba(1, 1, 1, 0.07)
+        for c in range(1, cols):
+            # Milieu de la gouttière entre la colonne c-1 et la colonne c.
+            x = round(c * colw + (c - 1) * s + s / 2)
+            cr.rectangle(x, 4, 1, max(0, h - 8))
+            cr.fill()
+        return False
+
     def _draw_bg(self, widget, cr):
         w, h, r = widget.get_allocated_width(), widget.get_allocated_height(), 10
         cr.set_source_rgba(*BG_RGB, self._bg_alpha)
@@ -2350,6 +2471,89 @@ class ClaudeWatcher(Gtk.Window):
 
     # ── Positionnement ────────────────────────────────────────────────────────
 
+    def _effective_cols(self) -> int:
+        """Nb de colonnes réellement utilisé = min(config, nb de sessions).
+
+        Inutile de réserver des colonnes vides : avec 4 colonnes configurées mais
+        2 sessions, on n'en affiche que 2 (sinon la fenêtre s'étire et des
+        séparateurs sont tracés sur du vide). Minimum 1 (état « aucune session »).
+        """
+        cols = max(1, getattr(CFG, 'columns', 1))
+        n = len(self.sessions)
+        return min(cols, n) if n else 1
+
+    def _window_width(self) -> int:
+        """Largeur totale = (largeur de colonne × nb colonnes effectif) + gouttières."""
+        cols = self._effective_cols()
+        return CFG.width * cols + COL_SPACING * (cols - 1)
+
+    def _max_content_height(self) -> int:
+        """Plafond de hauteur de la zone scrollable des sessions.
+
+        Toujours borné par l'écran (hauteur du moniteur moins la marge basse et
+        une réserve pour header/footer/séparateurs) ; CFG.max_height (si > 0) ne
+        fait que réduire davantage. max_height vide/0 → seul l'écran limite.
+        """
+        geom = self._get_monitor_geom()
+        screen_cap = max(120, geom.height - self.margin_y - 140)
+        mh = getattr(CFG, 'max_height', 0)
+        return min(screen_cap, mh) if mh else screen_cap
+
+    def _apply_window_size(self):
+        """(Ré)applique la largeur fenêtre et le plafond de hauteur scrollable.
+
+        Idempotent — rejouable à chaque changement de config (colonnes, largeur,
+        hauteur max, écran). Ne touche pas la largeur en mode roulé (pilule) ni
+        en largeur auto (la fenêtre suit alors sa taille naturelle)."""
+        self.sessions_scroll.set_max_content_height(self._max_content_height())
+        # propagate_natural_width UNIQUEMENT en largeur auto : sous policy
+        # horizontale NEVER, propager la largeur naturelle fait réclamer à la
+        # grille la largeur PLEINE des lignes (labels non ellipsés) → débordement.
+        self.sessions_scroll.set_propagate_natural_width(CFG.auto_width)
+
+        if self._rolled:
+            # Pilule enroulée : pas de contrainte, on laisse rétrécir au minimum.
+            self.set_geometry_hints(None, None, Gdk.WindowHints(0))
+            self._last_size = None
+            self.set_size_request(-1, -1)
+            self.resize(1, 1)
+            return
+        if CFG.auto_width:
+            # Largeur auto : la fenêtre suit sa taille naturelle (largeur ET
+            # hauteur). Resizable → on resize explicitement, sinon elle reste figée.
+            self.set_geometry_hints(None, None, Gdk.WindowHints(0))
+            self.set_size_request(-1, -1)
+            nat_w = min(self.get_preferred_width()[1], self._window_width())
+            nat_h = self.get_preferred_height()[1]
+            # nat_* peut valoir 0 avant que la fenêtre soit réalisée (init) →
+            # resize(_, 0) déclenche un Gtk-CRITICAL. On attend une taille valide.
+            if nat_w > 0 and nat_h > 0 and self._last_size != (nat_w, nat_h):
+                self._last_size = (nat_w, nat_h)
+                self.resize(nat_w, nat_h)
+            return
+
+        # Largeur fixe : la largeur est FORCÉE via geometry hints (min = max = w)
+        # — sinon set_resizable(False) dimensionnerait à la largeur NATURELLE, qui
+        # gonfle dès que l'en-tête (compteurs « N attente · … ») dépasse w et fait
+        # sortir la fenêtre de l'écran ; le contenu ellipsable s'adapte à w.
+        # La hauteur, elle, reste libre dans le hint mais doit être posée
+        # explicitement (fenêtre resizable) à la hauteur naturelle du contenu,
+        # elle-même plafonnée par max_content_height du scroll (→ barre de défilement).
+        w = self._window_width()
+        geo = Gdk.Geometry()
+        geo.min_width = geo.max_width = w
+        geo.min_height = 1
+        geo.max_height = 1 << 20
+        self.set_geometry_hints(None, geo, Gdk.WindowHints.MIN_SIZE | Gdk.WindowHints.MAX_SIZE)
+        self.set_size_request(w, -1)
+        nat_h = self.get_preferred_height()[1]
+        # nat_h == 0 avant réalisation de la fenêtre (init) → resize(w, 0) lève un
+        # Gtk-CRITICAL ; on saute et le prochain refresh (fenêtre réalisée) posera
+        # la bonne hauteur.
+        if nat_h > 0 and self._last_size != (w, nat_h):
+            self._last_size = (w, nat_h)
+            self.resize(w, nat_h)
+
     def _get_monitor_geom(self):
         display = Gdk.Display.get_default()
         idx = max(0, min(self.screen, display.get_n_monitors() - 1))
@@ -2360,7 +2564,8 @@ class ClaudeWatcher(Gtk.Window):
         if self._user_pos is not None:
             return self._user_pos
         geom = self._get_monitor_geom()
-        w = min(self.get_preferred_width()[1], CFG.width) if CFG.auto_width else CFG.width
+        w = (min(self.get_preferred_width()[1], self._window_width())
+             if CFG.auto_width else self._window_width())
         if self.corner in ('top-left', 'bottom-left'):
             x = geom.x + self.margin_x
         else:
@@ -2430,7 +2635,7 @@ class ClaudeWatcher(Gtk.Window):
             _, h = self.get_preferred_height()
             x, _ = self._compute_xy(h)
             band   = h + self.margin_y
-            h_end  = x + CFG.width
+            h_end  = x + self._window_width()
             strut  = [0] * 12
             if self.corner in ('top-left', 'top-right'):
                 strut[2] = band
@@ -2582,12 +2787,6 @@ class ClaudeWatcher(Gtk.Window):
         return True
 
     def _rebuild_sessions(self):
-        for child in self.sessions_box.get_children():
-            # destroy() (not remove()): releases the EventBox's GdkWindow and
-            # disconnects signal closures — remove() alone keeps the rows
-            # alive and RSS grows by ~20 MB/min.
-            child.destroy()
-
         waiting = sum(1 for s in self.sessions if s['waiting'])
         working = sum(1 for s in self.sessions if s['working'])
         total   = len(self.sessions)
@@ -2607,22 +2806,57 @@ class ClaudeWatcher(Gtk.Window):
             f'<span font="Monospace 8">{" · ".join(parts)}</span>'
         )
 
-        if not self.sessions:
-            lbl = Gtk.Label()
-            lbl.set_markup(
-                f'<span foreground="{TEXT_DIM}" font="Monospace 8">'
-                f'  {tr("no_session")}</span>'
-            )
-            lbl.set_halign(Gtk.Align.START)
-            lbl.set_margin_top(8)
-            lbl.set_margin_bottom(8)
-            lbl.set_margin_start(12)
-            self.sessions_box.pack_start(lbl, False, False, 0)
+        cols = self._effective_cols()
+        # Signature de structure : si colonnes + liste ordonnée des pids sont
+        # inchangées, on met à jour les lignes EN PLACE (update_session) au lieu de
+        # détruire/recréer. Sans ça, chaque refresh (toutes les 2 s ou à chaque
+        # event inotify) recrée toutes les SessionRow → le hover sous le curseur
+        # clignote et l'anim repart. Le destroy/recreate (qui libère les GdkWindow,
+        # cf. fuite RSS ~20 Mo/min avec un simple remove) n'a lieu que sur un vrai
+        # changement de structure : ajout/retrait/réordre de session, ou colonnes.
+        sig = (cols, tuple(s['pid'] for s in self.sessions))
+        if (sig == self._last_rows_sig
+                and self.sessions
+                and len(self._session_rows) == len(self.sessions)):
+            for row, s in zip(self._session_rows, self.sessions):
+                row.update_session(s)
         else:
-            for s in self.sessions:
-                self.sessions_box.pack_start(SessionRow(s), False, False, 0)
+            self._last_rows_sig = sig
+            for child in self.sessions_box.get_children():
+                # destroy() (pas remove()): libère le GdkWindow de l'EventBox et
+                # déconnecte les closures — remove() seul garde les lignes vivantes
+                # et la RSS grimpe de ~20 Mo/min.
+                child.destroy()
+            self._session_rows = []
+            if not self.sessions:
+                lbl = Gtk.Label()
+                lbl.set_markup(
+                    f'<span foreground="{TEXT_DIM}" font="Monospace 8">'
+                    f'  {tr("no_session")}</span>'
+                )
+                lbl.set_halign(Gtk.Align.START)
+                lbl.set_margin_top(8)
+                lbl.set_margin_bottom(8)
+                lbl.set_margin_start(12)
+                self.sessions_box.attach(lbl, 0, 0, cols, 1)
+            else:
+                # Remplissage ligne par ligne (row-major) : index i → colonne
+                # i%cols, rangée i//cols. hexpand pour que chaque colonne occupe sa
+                # part égale de la largeur (grille homogène).
+                for i, s in enumerate(self.sessions):
+                    row = SessionRow(s)
+                    row.set_hexpand(True)
+                    self._session_rows.append(row)
+                    self.sessions_box.attach(row, i % cols, i // cols, 1, 1)
+            self.sessions_box.show_all()
 
-        self.sessions_box.show_all()
+        # On (re)fixe largeur + hauteur (la hauteur peut bouger si un sujet
+        # apparaît/disparaît, même structure de pids).
+        # La fenêtre étant resizable (pour que nos hints de largeur tiennent), elle
+        # ne s'auto-dimensionne plus en hauteur → on resize explicitement à la
+        # hauteur naturelle (plafonnée par le scroll). _apply_window_size ne
+        # déclenche un resize que si la taille a réellement changé.
+        self._apply_window_size()
 
         if self._kb_index >= 0:
             self._kb_index = min(self._kb_index, len(self.sessions) - 1)
@@ -2633,8 +2867,8 @@ class ClaudeWatcher(Gtk.Window):
 
     def _tick_anim(self):
         self._anim_tick = (self._anim_tick + 1) % 6
-        for row in self.sessions_box.get_children():
-            if isinstance(row, SessionRow) and row.session['waiting']:
+        for row in self._session_rows:
+            if row.session['waiting']:
                 row._anim_tick = self._anim_tick
                 row.dot.queue_draw()
         return True

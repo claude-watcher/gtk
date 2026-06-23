@@ -17,6 +17,7 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
 - Middle-click to snooze/wake (fades the widget for a configurable duration)
 - **Shift + mouse wheel** adjusts opacity live
 - Mouse wheel on the title bar — or the ▾/▸ chevron — rolls the widget up/down
+- Multi-column layout for many sessions, with a configurable max height and a scrollbar beyond it
 - Configurable global hotkey (default `<Ctrl><Alt>q`) to start keyboard navigation
 - Drag the header or footer to reposition freely — position is remembered across restarts
 - Systray icon with global status indicator
