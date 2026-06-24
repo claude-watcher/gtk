@@ -4,6 +4,10 @@
 
 A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions on your machine and displays them in a persistent overlay — similar to a Conky system monitor.
 
+<p align="center">
+  <img src="doc/demo-en.gif" alt="Claude Code Watcher GTK widget tracking several sessions and switching to a two-column layout" width="720">
+</p>
+
 ## Features
 
 - Detects all active Claude Code sessions automatically
@@ -21,6 +25,7 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
 - Configurable global hotkey (default `<Ctrl><Alt>q`) to start keyboard navigation
 - Drag the header or footer to reposition freely — position is remembered across restarts
 - Systray icon with global status indicator
+- Footer shows the installed version with an update indicator (green = up to date, red = a newer release is available)
 - Language auto-detected from system locale (`fr` / `en`)
 
 > [!NOTE]
@@ -49,7 +54,7 @@ curl -fsSL https://github.com/claude-watcher/gtk/releases/latest/download/instal
 Pin a specific version instead of the latest:
 
 ```bash
-curl -fsSL https://github.com/claude-watcher/gtk/releases/download/v1.5.1/install.sh | bash
+curl -fsSL https://github.com/claude-watcher/gtk/releases/download/v1.4.0/install.sh | bash
 ```
 
 To **upgrade**, just re-run the `latest` one-liner.
