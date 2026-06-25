@@ -1754,7 +1754,13 @@ class ClaudeWatcher(Gtk.Window):
     def _snooze_wakeup(self):
         self._snooze_until = 0
         self._snooze_timer = None
-        Gtk.Widget.set_opacity(self, self._alpha)
+        # Full unhide (mirrors _toggle_visibility): the widget is completely
+        # gone while snoozed, not merely ghosted, so bring it back and
+        # reposition it.
+        if not self._hidden:
+            Gtk.Widget.set_opacity(self, self._alpha)
+            self.show_all()
+            GLib.idle_add(self._reposition)
         if self._tray:
             self._update_tray_menu_labels()
         return False
@@ -1767,7 +1773,9 @@ class ClaudeWatcher(Gtk.Window):
             self._snooze_wakeup()
         else:
             self._snooze_until = time.time() + CFG.snooze_sec
-            Gtk.Widget.set_opacity(self,0.08)
+            # Hide entirely (not a 0.08 ghost) and wake up on its own after
+            # snooze_sec via the timer below.
+            self.hide()
             self._snooze_timer = GLib.timeout_add_seconds(CFG.snooze_sec, self._snooze_wakeup)
         # Retitle immediately — waiting for the next refresh tick leaves a
         # stale label if the menu is reopened right away.
@@ -1775,12 +1783,12 @@ class ClaudeWatcher(Gtk.Window):
             self._update_tray_menu_labels()
 
     def _on_enter_window(self, widget, event):
-        if self._is_snoozed():
-            Gtk.Widget.set_opacity(self, min(self._alpha, 0.75))
+        # Snooze now hides the window outright, so there is nothing to reveal
+        # on hover — kept as a no-op for the connected signal.
+        return False
 
     def _on_leave_window(self, widget, event):
-        if self._is_snoozed():
-            Gtk.Widget.set_opacity(self,0.08)
+        return False
 
     def _on_window_press(self, _widget, event):
         # Session rows (focus) and the header (drag) only consume left
