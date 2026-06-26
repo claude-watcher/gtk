@@ -17,7 +17,8 @@ Un widget de bureau GTK3 pour Ubuntu qui surveille toutes les sessions Claude Co
   - **Idle** (vert) — session en pause
 - Utilisation de la fenêtre de contexte (`ctx%`) affichée si disponible
 - Clic sur une session pour focus le terminal correspondant
-- Clic droit pour le menu contextuel (afficher/masquer, snooze, réglages, quitter)
+- Clic droit sur une session pour son menu (focus, ou fermer une session inactive — envoie `SIGTERM`)
+- Clic droit sur l'en-tête pour le menu contextuel global (afficher/masquer, snooze, réglages, quitter)
 - Clic molette pour snoozer/réveiller (estompe le widget pendant une durée configurable)
 - **Maj + molette** pour ajuster l'opacité en direct
 - Molette sur la barre de titre — ou le chevron ▾/▸ — pour enrouler/dérouler le widget

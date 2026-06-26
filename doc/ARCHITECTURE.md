@@ -130,6 +130,18 @@ GNOME 46 removed the last external API (`Shell.Eval`) that allowed it.
 The rest of the widget — overlay, status detection, snooze — is fully functional
 on Wayland.
 
+### Closing a session
+
+Right-clicking a session row opens a per-row menu (left-click still focuses). For
+an **idle** session it offers *Close session*, which — after a confirmation —
+sends `SIGTERM` to the `claude` PID (clean exit, transcript flushed; never
+`SIGKILL`). The terminal itself stays open. The kill is gated by the same
+anti-PID-reuse guard used elsewhere: `kill_session` only fires if
+`get_session_registry(pid, starttime)` still resolves (i.e. `procStart` matches),
+so a recycled PID is never signalled. Active sessions (working/waiting) get no
+*Close* item — to avoid interrupting a turn in progress. The row disappears on the
+next scan once the process is gone.
+
 ## GTK window specifics
 
 - `Gtk.WindowType.POPUP` + `WindowTypeHint.DOCK` → always below normal windows,

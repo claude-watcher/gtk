@@ -224,6 +224,13 @@ STRINGS = {
         'tab_credits':   'Crédits',
         'authors':       'Auteurs',
         'close':         'Fermer',
+        # menu contextuel (clic droit sur une session) + confirmation de fermeture
+        'menu_focus':         'Focus',
+        'menu_kill':          'Fermer la session',
+        'kill_confirm_title': 'Fermer la session ?',
+        'kill_confirm_body':  'Fermer la session Claude « {proj} » (inactive depuis {idle}) ?\n'
+                              'Le terminal reste ouvert.',
+        'kill_failed':        'Impossible de fermer la session (process introuvable ou déjà terminé).',
         # dialogue paramètres
         'settings_title': 'Paramètres — Claude Code Watcher',
         'cancel':         'Annuler',
@@ -306,6 +313,13 @@ STRINGS = {
         'tab_credits':   'Credits',
         'authors':       'Authors',
         'close':         'Close',
+        # context menu (right-click on a session) + close confirmation
+        'menu_focus':         'Focus',
+        'menu_kill':          'Close session',
+        'kill_confirm_title': 'Close session?',
+        'kill_confirm_body':  'Close the Claude session “{proj}” (idle for {idle})?\n'
+                              'The terminal stays open.',
+        'kill_failed':        'Could not close the session (process gone or already exited).',
         # settings dialog
         'settings_title': 'Settings — Claude Code Watcher',
         'cancel':         'Cancel',
@@ -450,6 +464,24 @@ def get_claude_processes() -> list[dict]:
         procs.append({'pid': int(entry.name), 'elapsed': elapsed,
                       'start_unix': start_unix, 'starttime': starttime})
     return procs
+
+
+def kill_session(pid: int, starttime: int, config_dir: str | None = None) -> bool:
+    """Ferme une session Claude via SIGTERM, avec garde anti-recyclage de PID.
+
+    Réutilise get_session_registry, qui ne renvoie le registre QUE si procStart
+    == starttime : un None ici = process disparu ou PID recyclé entre le scan et
+    le clic → on ne tire pas (pas d'innocent tué). SIGTERM laisse Claude flusher
+    son transcript et sortir proprement (pas de SIGKILL). Retourne True si le
+    signal est parti.
+    """
+    if get_session_registry(pid, starttime, config_dir) is None:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True
+    except OSError:
+        return False
 
 
 def get_wchan(pid: int) -> str:
@@ -1097,6 +1129,7 @@ def scan_sessions() -> list[dict]:
         confirmed_wt = wt_name is not None and last_activity is not None
         sessions.append({
             'pid':             pid,
+            'starttime':       p['starttime'],
             'project':         project_label(wt_root if confirmed_wt else cwd),
             'worktree':        wt_name if confirmed_wt else None,
             'topic':           topic,
@@ -1371,7 +1404,63 @@ class SessionRow(Gtk.EventBox):
         if event.button == 1:
             self._do_focus()
             return True  # don't bubble up to the window background menu
+        if event.button == 3:
+            self._show_context_menu(event)
+            return True
         return False
+
+    def _show_context_menu(self, event):
+        s = self.session
+        # Référence gardée sur self : sinon le menu est ramassé par le GC avant
+        # même de s'afficher.
+        self._ctx_menu = menu = Gtk.Menu()
+        item_focus = Gtk.MenuItem.new_with_label(tr('menu_focus'))
+        item_focus.connect('activate', lambda _m: self._do_focus())
+        menu.append(item_focus)
+        # « Fermer » réservé aux sessions inactives : on ne propose pas de tuer
+        # une session qui travaille ou attend une réponse (tour en cours).
+        if not s['waiting'] and not s['working']:
+            item_kill = Gtk.MenuItem.new_with_label(tr('menu_kill'))
+            item_kill.connect('activate', lambda _m: self._confirm_kill())
+            menu.append(item_kill)
+        menu.show_all()
+        menu.popup_at_pointer(event)
+
+    def _confirm_kill(self):
+        s = self.session
+        la = s.get('last_activity')
+        idle_txt = format_idle(time.time() - la, 'precise') if la is not None else '?'
+        dlg = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), modal=True,
+            message_type=Gtk.MessageType.QUESTION,
+            buttons=Gtk.ButtonsType.OK_CANCEL,
+            text=tr('kill_confirm_title'),
+        )
+        dlg.format_secondary_text(
+            tr('kill_confirm_body').format(proj=s['project'], idle=idle_txt))
+        # Le widget est un DOCK toujours-au-dessus : sans keep_above le dialogue
+        # passe DERRIÈRE. Centré écran plutôt que sur le petit widget du coin.
+        dlg.set_keep_above(True)
+        dlg.set_position(Gtk.WindowPosition.CENTER)
+        resp = dlg.run()
+        dlg.destroy()
+        if resp == Gtk.ResponseType.OK:
+            self._do_kill()
+
+    def _do_kill(self):
+        s = self.session
+        if kill_session(s['pid'], s.get('starttime', 0), s.get('config_dir')):
+            return  # la ligne disparaîtra au prochain scan (process terminé)
+        warn = Gtk.MessageDialog(
+            transient_for=self.get_toplevel(), modal=True,
+            message_type=Gtk.MessageType.WARNING,
+            buttons=Gtk.ButtonsType.CLOSE,
+            text=tr('kill_failed'),
+        )
+        warn.set_keep_above(True)
+        warn.set_position(Gtk.WindowPosition.CENTER)
+        warn.run()
+        warn.destroy()
 
 # ── Settings dialog ──────────────────────────────────────────────────────────
 
