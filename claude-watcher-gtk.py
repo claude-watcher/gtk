@@ -2519,13 +2519,16 @@ class ClaudeWatcher(Gtk.Window):
         # grille la largeur PLEINE des lignes (labels non ellipsés) → débordement.
         self.sessions_scroll.set_propagate_natural_width(CFG.auto_width)
 
-        if self._rolled:
-            # Pilule enroulée : pas de contrainte, on laisse rétrécir au minimum.
+        if self._rolled and CFG.auto_width:
+            # Pilule enroulée (largeur auto) : pas de contrainte, rétrécit au minimum.
             self.set_geometry_hints(None, None, Gdk.WindowHints(0))
             self._last_size = None
             self.set_size_request(-1, -1)
             self.resize(1, 1)
             return
+        # En largeur fixe, l'en-tête enroulé conserve la largeur configurée (il
+        # retombe dans le chemin « largeur fixe » plus bas) pour rester aligné
+        # avec la fenêtre déployée ; seules les lignes masquées libèrent la hauteur.
         if CFG.auto_width:
             # Largeur auto : la fenêtre suit sa taille naturelle (largeur ET
             # hauteur). Resizable → on resize explicitement, sinon elle reste figée.
