@@ -594,15 +594,34 @@ def classify_state_from_title(title: str | None) -> str | None:
     return None
 
 
+_WORKTREE_MARKER = '/.claude/worktrees/'
+
+
+def split_worktree(cwd: str | None) -> tuple[str | None, str | None]:
+    """Sépare un cwd de worktree Claude en (racine projet, nom du worktree).
+
+    <projet>/.claude/worktrees/<nom>[/sous-dossier] → (<projet>, <nom>).
+    Hors worktree → (cwd, None). C'est la source unique du marqueur worktree.
+    """
+    if cwd and _WORKTREE_MARKER in cwd:
+        root, _, rest = cwd.partition(_WORKTREE_MARKER)
+        return root, rest.split('/', 1)[0]
+    return cwd, None
+
+
 def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path | None:
     if not cwd:
         return None
     # Instance CLAUDE_CONFIG_DIR custom → ses JSONL vivent dans <config_dir>/projects,
     # pas dans ~/.claude/projects. Sinon état/contexte lus au mauvais endroit.
     base = Path(config_dir) / 'projects' if config_dir else CLAUDE_PROJECTS_DIR
+    # Worktree Claude : Claude range le transcript sous le slug du PROJET PARENT,
+    # pas du cwd du worktree. On retombe sur la racine projet. Inoffensif hors
+    # worktree ; au pire le dir n'existe pas → None.
+    root, _ = split_worktree(cwd)
     # Claude slugifie le cwd en remplaçant CHAQUE non-alphanumérique par '-'
     # (pas seulement '/'), donc 'geoffrey.laurent' → 'geoffrey-laurent'.
-    slug = re.sub(r'[^a-zA-Z0-9]', '-', cwd)
+    slug = re.sub(r'[^a-zA-Z0-9]', '-', root)
     path = base / slug
     return path if path.exists() else None
 
@@ -1058,9 +1077,16 @@ def scan_sessions() -> list[dict]:
                 config_dir = None
         state, context_pct, tool, topic, last_activity = get_session_state(
             pid, cwd, p['starttime'], config_dir)
+        # Worktree « confirmé » = marqueur détecté ET transcript résolu
+        # (last_activity = mtime du JSONL trouvé). On affiche alors le VRAI projet
+        # (racine parente) en titre, le nom du worktree en sous-ligne. Non confirmé
+        # → comportement inchangé (label = cwd brut, pas de sous-ligne).
+        wt_root, wt_name = split_worktree(cwd)
+        confirmed_wt = wt_name is not None and last_activity is not None
         sessions.append({
             'pid':             pid,
-            'project':         project_label(cwd),
+            'project':         project_label(wt_root if confirmed_wt else cwd),
+            'worktree':        wt_name if confirmed_wt else None,
             'topic':           topic,
             'cwd':             cwd or '?',
             'elapsed':         p['elapsed'],
@@ -1145,6 +1171,15 @@ class SessionRow(Gtk.EventBox):
         self.lbl_project.set_hexpand(True)
         self.lbl_project.set_ellipsize(Pango.EllipsizeMode.END)
         self.lbl_project.set_max_width_chars(40)
+        # Sous-ligne worktree : « ↳ WT: <nom> » sous le projet quand la session
+        # tourne dans un worktree Claude confirmé. Masquée sinon, sans gap.
+        self.lbl_worktree = Gtk.Label()
+        self.lbl_worktree.set_halign(Gtk.Align.FILL)
+        self.lbl_worktree.set_xalign(0.0)
+        self.lbl_worktree.set_hexpand(True)
+        self.lbl_worktree.set_ellipsize(Pango.EllipsizeMode.END)
+        self.lbl_worktree.set_max_width_chars(40)
+        self.lbl_worktree.set_no_show_all(True)
         # Topic IA : distingue plusieurs sessions partageant le même cwd.
         self.lbl_topic = Gtk.Label()
         self.lbl_topic.set_halign(Gtk.Align.FILL)
@@ -1160,9 +1195,10 @@ class SessionRow(Gtk.EventBox):
         self.lbl_meta.set_xalign(0.0)
         self.lbl_meta.set_ellipsize(Pango.EllipsizeMode.END)
         self.lbl_meta.set_max_width_chars(40)
-        info.pack_start(self.lbl_project, False, False, 0)
-        info.pack_start(self.lbl_topic,   False, False, 0)
-        info.pack_start(self.lbl_meta,    False, False, 0)
+        info.pack_start(self.lbl_project,  False, False, 0)
+        info.pack_start(self.lbl_worktree, False, False, 0)
+        info.pack_start(self.lbl_topic,    False, False, 0)
+        info.pack_start(self.lbl_meta,     False, False, 0)
         box.pack_start(info, True, True, 0)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -1210,6 +1246,15 @@ class SessionRow(Gtk.EventBox):
             f'<span foreground="{TEXT_PRIMARY}" font="Monospace 9" weight="500">'
             f'{GLib.markup_escape_text(s["project"])}</span>'
         )
+        worktree = s.get('worktree')
+        if worktree:
+            self.lbl_worktree.set_markup(
+                f'<span foreground="{COLOR_CLAUDE}" font="Monospace 8">'
+                f'↳ WT: {GLib.markup_escape_text(worktree)}</span>'
+            )
+            self.lbl_worktree.set_visible(True)
+        else:
+            self.lbl_worktree.set_visible(False)
         topic = (s.get('topic') or '').strip().split('\n', 1)[0]
         if topic:
             self.lbl_topic.set_markup(
@@ -3006,9 +3051,13 @@ def dump_round():
         jsonl_state, ctx, tool, topic, _ = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
         # Source de vérité : même appel que l'app, pour que `state` colle au badge.
         state, _, _, _, last_activity = get_session_state(pid, cwd, p['starttime'], config_dir)
+        # Worktree confirmé : même logique que scan_sessions (label = projet parent).
+        wt_root, wt_name = split_worktree(eff_cwd)
+        confirmed_wt = wt_name is not None and last_activity is not None
         reg_mapped = _STATUS_MAP.get(reg_status or '', 'idle') if reg else '(no registry)'
-        print(f"pid {pid}  {project_label(eff_cwd)}  ({format_elapsed(p['elapsed'])})")
+        print(f"pid {pid}  {project_label(wt_root if confirmed_wt else eff_cwd)}  ({format_elapsed(p['elapsed'])})")
         print(f"  cwd          {eff_cwd or '?'}")
+        print(f"  worktree     {wt_name if confirmed_wt else ('(detected, unconfirmed)' if wt_name else '(none)')}")
         print(f"  config_dir   {display_config_dir(config_dir) or '(default)'}")
         print(f"  session_id   {session_id or '(none)'}")
         print(f"  reg.status   {reg_status!r} -> {reg_mapped}")

@@ -42,6 +42,13 @@ Code writes it; otherwise state is derived from the session **transcript**
 exists depends on the Claude Code version, so the widget uses it when present
 and falls back to the transcript when it is not.
 
+Sessions running inside a Claude **worktree** (`<project>/.claude/worktrees/<name>`)
+keep their transcript under the *parent project's* slug, not the worktree path.
+The widget detects the marker, resolves to the parent project (so context %, topic
+and idle time work), labels the row with the real project name, and adds a
+`↳ WT: <name>` sub-line. When the parent transcript can't be confirmed it leaves
+the raw label untouched.
+
 1. The widget enumerates sessions by scanning `/proc/<pid>/comm` for an exact
    match on `claude`; field 22 of `/proc/<pid>/stat` gives the process
    `starttime` (in ticks).
