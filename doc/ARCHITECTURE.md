@@ -19,6 +19,8 @@ width      = 320   # widget width in pixels
 refresh_ms = 2000  # refresh interval in milliseconds (inotify drives instant updates; this is the fallback)
 snooze_sec = 30    # snooze duration in seconds
 bg_alpha   = 88    # opacity in % (20-100) — also adjustable live with Shift+scroll
+sort_mode   = default  # default (state then project) | idle (state then most-recently-idle first)
+idle_format = none     # idle duration shown on idle rows: none | loose (minute res, [Nd ]HH:MM) | precise ([Nd ]HH:MM:SS)
 
 [features]
 tray            = true   # systray icon (true | false)
@@ -39,6 +41,13 @@ Code writes it; otherwise state is derived from the session **transcript**
 (`~/.claude/projects/<slug>/<sessionId>.jsonl`). Whether the registry file
 exists depends on the Claude Code version, so the widget uses it when present
 and falls back to the transcript when it is not.
+
+Sessions running inside a Claude **worktree** (`<project>/.claude/worktrees/<name>`)
+keep their transcript under the *parent project's* slug, not the worktree path.
+The widget detects the marker, resolves to the parent project (so context %, topic
+and idle time work), labels the row with the real project name, and adds a
+`↳ WT: <name>` sub-line. When the parent transcript can't be confirmed it leaves
+the raw label untouched.
 
 1. The widget enumerates sessions by scanning `/proc/<pid>/comm` for an exact
    match on `claude`; field 22 of `/proc/<pid>/stat` gives the process
