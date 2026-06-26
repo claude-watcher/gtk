@@ -17,7 +17,8 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
   - **Idle** (green) — session paused
 - Context window usage (`ctx%`) shown when available
 - Click a session row to focus its terminal window
-- Right-click for a context menu (show/hide, snooze, settings, quit)
+- Right-click a session row for its menu (focus, or close an idle session — sends `SIGTERM`)
+- Right-click the header for the global context menu (show/hide, snooze, settings, quit)
 - Middle-click to snooze/wake (fades the widget for a configurable duration)
 - **Shift + mouse wheel** adjusts opacity live
 - Mouse wheel on the title bar — or the ▾/▸ chevron — rolls the widget up/down
