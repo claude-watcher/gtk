@@ -110,6 +110,8 @@ def load_config() -> dict:
     g = cfg['general']  if 'general'  in cfg else {}
     f = cfg['features'] if 'features' in cfg else {}
 
+    idle_fmt = d.get('idle_format', 'none').lower()
+
     return {
         'lang':       g.get('lang', _detect_lang()),
         'mode':       d.get('mode', 'corner'),
@@ -124,6 +126,10 @@ def load_config() -> dict:
         # clé absente (None) comme la valeur vide ('').
         'columns':    max(1, int(d.get('columns') or 1)),
         'max_height': max(0, int(d.get('max_height') or 0)),
+        # Tri : 'default' (alpha) ou 'idle' (par ancienneté d'inactivité). Format
+        # de la durée d'inactivité affichée : 'none' (off), 'loose' (~Xm), 'precise'.
+        'sort_mode':  'idle' if d.get('sort_mode', 'default').lower() == 'idle' else 'default',
+        'idle_format': idle_fmt if idle_fmt in ('none', 'loose', 'precise') else 'none',
         'show_topic': f.get('show_topic', 'true').lower() == 'true',
         'refresh_ms': int(d.get('refresh_ms', 2000)),
         'snooze_sec': int(d.get('snooze_sec', 30)),
@@ -167,6 +173,8 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
     args.auto_width = defaults['auto_width']
     args.columns    = defaults['columns']
     args.max_height = defaults['max_height']
+    args.sort_mode   = defaults['sort_mode']
+    args.idle_format = defaults['idle_format']
     args.show_topic = defaults['show_topic']
     args.refresh_ms = defaults['refresh_ms']
     args.snooze_sec        = defaults['snooze_sec']
@@ -242,6 +250,13 @@ STRINGS = {
                             'Une valeur > 0 plafonne en plus à ce nombre de pixels ; '
                             'au-delà, la liste des sessions défile.'),
         'fld_show_topic': 'Afficher le sujet de session',
+        'fld_sort':        'Tri',
+        'sort_default':    'Par défaut (projet)',
+        'sort_idle':       'Par inactivité',
+        'fld_idle_format': 'Durée d’inactivité',
+        'idle_none':       'Masquée',
+        'idle_loose':      'Approx. (~Xm)',
+        'idle_precise':    'Précise (1d 02:24:23)',
         'fld_refresh':    'Rafraîch.',
         'fld_snooze':     'Veille',
         'fld_bg_alpha':   'Opacité',
@@ -316,6 +331,13 @@ STRINGS = {
                             'the screen size anyway. A value > 0 additionally caps '
                             'it to that many pixels; beyond it, the session list scrolls.'),
         'fld_show_topic': 'Show session topic',
+        'fld_sort':        'Sort',
+        'sort_default':    'Default (project)',
+        'sort_idle':       'By idle time',
+        'fld_idle_format': 'Idle duration',
+        'idle_none':       'Hidden',
+        'idle_loose':      'Approx. (~Xm)',
+        'idle_precise':    'Precise (1d 02:24:23)',
         'fld_refresh':    'Refresh',
         'fld_snooze':     'Snooze',
         'fld_bg_alpha':   'Opacity',
@@ -741,14 +763,16 @@ def get_session_info_from_jsonl(
     cwd: str | None,
     config_dir: str | None = None,
     session_id: str | None = None,
-) -> tuple[str | None, int | None, str | None, str | None]:
+) -> tuple[str | None, int | None, str | None, str | None, float | None]:
     """État + % de contexte + outil courant + topic depuis le JSONL de la session.
 
-    Retourne (state, context_pct, tool, topic) :
+    Retourne (state, context_pct, tool, topic, mtime) :
       state      : 'waiting' | 'working' | 'idle' | None (fallback registre absent)
       context_pct: 0-100 (% du contexte utilisé) | None si indisponible
       tool       : nom de l'outil courant | None
       topic      : titre IA de la session, sinon dernier prompt | None
+      mtime      : mtime du JSONL (= dernière activité, proxy « inactif depuis »)
+                   | None si le JSONL est introuvable
 
     Si `session_id` est fourni, cible directement <session_id>.jsonl (chemin
     exact donné par le registre, aucun devinage) ; sinon retombe sur le .jsonl
@@ -757,7 +781,7 @@ def get_session_info_from_jsonl(
     """
     project_dir = cwd_to_project_dir(cwd, config_dir)
     if not project_dir:
-        return None, None, None, None
+        return None, None, None, None, None
     latest = None
     if session_id:
         cand = project_dir / f'{session_id}.jsonl'
@@ -766,18 +790,18 @@ def get_session_info_from_jsonl(
     if latest is None:
         jsonl_files = [f for f in project_dir.glob('*.jsonl') if f.is_file()]
         if not jsonl_files:
-            return None, None, None, None
+            return None, None, None, None, None
         try:
             latest, _ = max(
                 ((f, f.stat().st_mtime) for f in jsonl_files),
                 key=lambda x: x[1],
             )
         except (OSError, ValueError):
-            return None, None, None, None
+            return None, None, None, None, None
     try:
         mtime = latest.stat().st_mtime
     except OSError:
-        return None, None, None, None
+        return None, None, None, None, None
     key = str(latest)
     cached = _JSONL_CACHE.get(key)
     if cached and cached[0] == mtime:
@@ -802,7 +826,7 @@ def get_session_info_from_jsonl(
         topic = title or last_prompt
     else:
         topic = None
-    return result[0], result[1], result[2], topic
+    return result[0], result[1], result[2], topic, mtime
 
 
 def get_session_registry(pid: int, starttime: int,
@@ -840,8 +864,8 @@ def get_session_registry(pid: int, starttime: int,
 
 def get_session_state(pid: int, cwd: str | None,
                       starttime: int = 0,
-                      config_dir: str | None = None) -> tuple[str, int | None, str | None, str | None]:
-    """État de la session. Retourne (state, context_pct, tool_name, topic).
+                      config_dir: str | None = None) -> tuple[str, int | None, str | None, str | None, float | None]:
+    """État de la session. Retourne (state, context_pct, tool_name, topic, last_activity).
 
     Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) est
     prioritaire quand il existe ; selon la version de Claude Code il peut être
@@ -855,7 +879,8 @@ def get_session_state(pid: int, cwd: str | None,
     session_id = reg.get('sessionId') if reg else None
     if reg and not cwd:
         cwd = reg.get('cwd')
-    jsonl_state, context_pct, tool, topic = get_session_info_from_jsonl(cwd, config_dir, session_id)
+    jsonl_state, context_pct, tool, topic, last_activity = get_session_info_from_jsonl(
+        cwd, config_dir, session_id)
     if reg:
         status = reg.get('status', '')
         state = _STATUS_MAP.get(status, 'idle')
@@ -871,7 +896,7 @@ def get_session_state(pid: int, cwd: str | None,
             state = jsonl_state
     else:
         state = jsonl_state or 'idle'
-    return state, context_pct, tool, topic
+    return state, context_pct, tool, topic, last_activity
 
 
 def format_elapsed(s) -> str:
@@ -879,6 +904,22 @@ def format_elapsed(s) -> str:
     if s < 60:   return f"{s}s"
     if s < 3600: return f"{s//60}m{s%60:02d}s"
     return f"{s//3600}h{(s%3600)//60:02d}m"
+
+
+def format_idle(secs, mode: str) -> str:
+    """Durée d'inactivité formatée. mode='loose' (~Xm approx) ou 'precise' ([Nd ]HH:MM:SS)."""
+    s = max(0, int(secs))
+    if mode == 'precise':
+        d, rem = divmod(s, 86400)
+        h, rem = divmod(rem, 3600)
+        m, sec = divmod(rem, 60)
+        clock = f'{h:02d}:{m:02d}:{sec:02d}'
+        return f'{d}d {clock}' if d else clock
+    # loose : unité la plus significative, préfixée d'un ~ (approximatif)
+    if s < 60:    return f'~{s}s'
+    if s < 3600:  return f'~{s//60}m'
+    if s < 86400: return f'~{s//3600}h'
+    return f'~{s//86400}d'
 
 
 def project_label(cwd: str | None) -> str:
@@ -1015,7 +1056,7 @@ def scan_sessions() -> list[dict]:
             config_dir = os.path.expanduser(config_dir)
             if not os.path.isabs(config_dir):
                 config_dir = None
-        state, context_pct, tool, topic = get_session_state(
+        state, context_pct, tool, topic, last_activity = get_session_state(
             pid, cwd, p['starttime'], config_dir)
         sessions.append({
             'pid':             pid,
@@ -1032,9 +1073,27 @@ def scan_sessions() -> list[dict]:
             'kitty_socket':    kitty_socket,
             'kitty_window_id': kitty_window_id,
             'config_dir':      config_dir,
+            'last_activity':   last_activity,
         })
-    # Priorité d'état (attente > travaille > idle), puis alpha par projet.
-    sessions.sort(key=lambda s: (not s['waiting'], not s['working'], s['project'].lower()))
+    # Priorité d'état (attente > travaille > idle) dans tous les modes. En mode
+    # 'idle', SEUL le groupe inactif est départagé par ancienneté d'inactivité
+    # (plus récemment devenu inactif en tête) ; attente/travaille gardent le tri
+    # alpha. Trier les sessions actives par mtime serait instable — leur JSONL
+    # bouge en continu, l'ordre changerait à chaque scan, forçant un rebuild
+    # complet des lignes (flicker + churn RSS). last_activity absent (JSONL
+    # introuvable) → coule en bas du groupe inactif via +inf.
+    if getattr(CFG, 'sort_mode', 'default') == 'idle':
+        now = time.time()
+        def _sort_key(s: dict) -> tuple:
+            if s['waiting']:   bucket = 0
+            elif s['working']: bucket = 1
+            else:              bucket = 2
+            la = s.get('last_activity')
+            idle = ((now - la) if la is not None else float('inf')) if bucket == 2 else 0.0
+            return (bucket, idle, s['project'].lower())
+        sessions.sort(key=_sort_key)
+    else:
+        sessions.sort(key=lambda s: (not s['waiting'], not s['working'], s['project'].lower()))
     return sessions
 
 # ── Session row ───────────────────────────────────────────────────────────────
@@ -1183,10 +1242,19 @@ class SessionRow(Gtk.EventBox):
             )
         self.lbl_meta.set_markup(meta)
         tool = s.get('tool') if (s['working'] or s['waiting']) else None
+        idle_fmt = getattr(CFG, 'idle_format', 'none')
+        la = s.get('last_activity')
         if tool:
             self.lbl_ctx.set_markup(
                 f'<span foreground="{TEXT_DIM2}" font="Monospace 8">'
                 f'{GLib.markup_escape_text(tool)}</span>'
+            )
+        elif not s['working'] and not s['waiting'] and idle_fmt != 'none' and la is not None:
+            # Session inactive : la colonne outil (vide en idle) sert la durée
+            # d'inactivité = now − dernière activité (mtime du JSONL).
+            self.lbl_ctx.set_markup(
+                f'<span foreground="{TEXT_DIM2}" font="Monospace 8">'
+                f'{GLib.markup_escape_text(format_idle(time.time() - la, idle_fmt))}</span>'
             )
         else:
             self.lbl_ctx.set_text('')
@@ -1267,6 +1335,8 @@ class SettingsDialog(Gtk.Dialog):
             'auto_width': CFG.auto_width,
             'columns':    getattr(CFG, 'columns', 1),
             'max_height': getattr(CFG, 'max_height', 0),
+            'sort_mode':  getattr(CFG, 'sort_mode', 'default'),
+            'idle_format': getattr(CFG, 'idle_format', 'none'),
             'show_topic': getattr(CFG, 'show_topic', True),
             'refresh_ms': CFG.refresh_ms,
             'snooze_sec': CFG.snooze_sec,
@@ -1460,6 +1530,21 @@ class SettingsDialog(Gtk.Dialog):
         g2.attach(self._spin_max_height, 1, 7, 1, 1)
         g2.attach(Gtk.Label(label="px"), 2, 7, 1, 1)
 
+        g2.attach(field_label(tr('fld_sort')), 0, 8, 1, 1)
+        self._combo_sort = Gtk.ComboBoxText()
+        self._combo_sort.append('default', tr('sort_default'))
+        self._combo_sort.append('idle',    tr('sort_idle'))
+        self._combo_sort.set_active_id(getattr(CFG, 'sort_mode', 'default'))
+        g2.attach(self._combo_sort, 1, 8, 2, 1)
+
+        g2.attach(field_label(tr('fld_idle_format')), 0, 9, 1, 1)
+        self._combo_idle = Gtk.ComboBoxText()
+        self._combo_idle.append('none',    tr('idle_none'))
+        self._combo_idle.append('loose',   tr('idle_loose'))
+        self._combo_idle.append('precise', tr('idle_precise'))
+        self._combo_idle.set_active_id(getattr(CFG, 'idle_format', 'none'))
+        g2.attach(self._combo_idle, 1, 9, 2, 1)
+
         # ── Raccourci clavier ────────────────────────────────────────────────
         outer.pack_start(Gtk.Separator(), False, False, 0)
         outer.pack_start(section_label(tr('sec_shortcut')), False, False, 0)
@@ -1494,6 +1579,8 @@ class SettingsDialog(Gtk.Dialog):
             (self._spin_bg_alpha, 'value-changed'),
             (self._spin_columns,    'value-changed'),
             (self._spin_max_height, 'value-changed'),
+            (self._combo_sort,      'changed'),
+            (self._combo_idle,      'changed'),
         ]:
             widget.connect(signal, self._on_preview_change)
 
@@ -1528,6 +1615,8 @@ class SettingsDialog(Gtk.Dialog):
             'auto_width': self._chk_auto_width.get_active(),
             'columns':    int(self._spin_columns.get_value()),
             'max_height': int(self._spin_max_height.get_value()),
+            'sort_mode':  self._combo_sort.get_active_id() or 'default',
+            'idle_format': self._combo_idle.get_active_id() or 'none',
             'show_topic': self._chk_show_topic.get_active(),
             'refresh_ms': int(self._spin_refresh.get_value()),
             'snooze_sec': int(self._spin_snooze.get_value()),
@@ -2281,6 +2370,10 @@ class ClaudeWatcher(Gtk.Window):
         CFG.auto_width = values['auto_width']
         CFG.columns    = values['columns']
         CFG.max_height = values['max_height']
+        # Tri + format d'inactivité : relus par scan_sessions / SessionRow au
+        # _refresh() final ci-dessous.
+        CFG.sort_mode   = values['sort_mode']
+        CFG.idle_format = values['idle_format']
         # _apply_window_size recalcule largeur (colonnes × largeur) + plafond de
         # hauteur scrollable, et respecte le mode roulé / largeur auto. Le
         # ré-agencement des colonnes se fait dans le _refresh() final (lit CFG.columns).
@@ -2322,6 +2415,8 @@ class ClaudeWatcher(Gtk.Window):
         cfg_file['display']['auto_width'] = 'true' if values['auto_width'] else 'false'
         cfg_file['display']['columns']    = str(values['columns'])
         cfg_file['display']['max_height'] = str(values['max_height'])
+        cfg_file['display']['sort_mode']  = values['sort_mode']
+        cfg_file['display']['idle_format'] = values['idle_format']
         cfg_file['display']['refresh_ms'] = str(values['refresh_ms'])
         cfg_file['display']['snooze_sec'] = str(values['snooze_sec'])
         cfg_file['display']['bg_alpha']   = str(values['bg_alpha'])
@@ -2908,9 +3003,9 @@ def dump_round():
         reg_status = reg.get('status') if reg else None
         session_id = reg.get('sessionId') if reg else None
         eff_cwd = cwd or (reg.get('cwd') if reg else None)
-        jsonl_state, ctx, tool, topic = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
+        jsonl_state, ctx, tool, topic, _ = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
         # Source de vérité : même appel que l'app, pour que `state` colle au badge.
-        state, _, _, _ = get_session_state(pid, cwd, p['starttime'], config_dir)
+        state, _, _, _, last_activity = get_session_state(pid, cwd, p['starttime'], config_dir)
         reg_mapped = _STATUS_MAP.get(reg_status or '', 'idle') if reg else '(no registry)'
         print(f"pid {pid}  {project_label(eff_cwd)}  ({format_elapsed(p['elapsed'])})")
         print(f"  cwd          {eff_cwd or '?'}")
@@ -2922,6 +3017,8 @@ def dump_round():
         print(f"  context_pct  {ctx}")
         print(f"  tool         {tool}")
         print(f"  topic        {topic}")
+        idle_for = f"{int(time.time() - last_activity)}s" if last_activity else '(unknown)'
+        print(f"  idle_for     {idle_for}")
         print()
 
 
