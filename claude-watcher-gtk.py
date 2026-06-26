@@ -255,7 +255,7 @@ STRINGS = {
         'sort_idle':       'Par inactivité',
         'fld_idle_format': 'Durée d’inactivité',
         'idle_none':       'Masquée',
-        'idle_loose':      'Approx. (~Xm)',
+        'idle_loose':      'Approx. (HH:MM)',
         'idle_precise':    'Précise (1d 02:24:23)',
         'fld_refresh':    'Rafraîch.',
         'fld_snooze':     'Veille',
@@ -336,7 +336,7 @@ STRINGS = {
         'sort_idle':       'By idle time',
         'fld_idle_format': 'Idle duration',
         'idle_none':       'Hidden',
-        'idle_loose':      'Approx. (~Xm)',
+        'idle_loose':      'Approx. (HH:MM)',
         'idle_precise':    'Precise (1d 02:24:23)',
         'fld_refresh':    'Refresh',
         'fld_snooze':     'Snooze',
@@ -913,6 +913,17 @@ def get_session_state(pid: int, cwd: str | None,
         # condition est alors fausse et on garde l'ancien comportement.
         if status == 'shell' and jsonl_state in ('waiting', 'idle'):
             state = jsonl_state
+        # Idle-since : instant EXACT du dernier changement d'état du registre
+        # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
+        # écritures de fond (résumés, todos) sans refléter l'inactivité réelle —
+        # il sur-estimait la fraîcheur. Fallback mtime si le champ est absent
+        # (version de Claude antérieure).
+        ts = reg.get('statusUpdatedAt') or reg.get('updatedAt')
+        if ts is not None:
+            try:
+                last_activity = float(ts) / 1000.0
+            except (TypeError, ValueError):
+                pass
     else:
         state = jsonl_state or 'idle'
     return state, context_pct, tool, topic, last_activity
@@ -934,11 +945,12 @@ def format_idle(secs, mode: str) -> str:
         m, sec = divmod(rem, 60)
         clock = f'{h:02d}:{m:02d}:{sec:02d}'
         return f'{d}d {clock}' if d else clock
-    # loose : unité la plus significative, préfixée d'un ~ (approximatif)
-    if s < 60:    return f'~{s}s'
-    if s < 3600:  return f'~{s//60}m'
-    if s < 86400: return f'~{s//3600}h'
-    return f'~{s//86400}d'
+    # loose : même découpage que precise mais SANS les secondes (résolution
+    # minute) → ne change qu'une fois par minute, attire moins l'œil.
+    d, rem = divmod(s, 86400)
+    h, m = divmod(rem // 60, 60)
+    clock = f'{h:02d}:{m:02d}'
+    return f'{d}d {clock}' if d else clock
 
 
 def project_label(cwd: str | None) -> str:

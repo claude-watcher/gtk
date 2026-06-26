@@ -20,7 +20,7 @@ refresh_ms = 2000  # refresh interval in milliseconds (inotify drives instant up
 snooze_sec = 30    # snooze duration in seconds
 bg_alpha   = 88    # opacity in % (20-100) — also adjustable live with Shift+scroll
 sort_mode   = default  # default (state then project) | idle (state then most-recently-idle first)
-idle_format = none     # idle duration shown on idle rows: none | loose (approx, ~Xs/~Xm/~Xh/~Xd) | precise ([Nd ]HH:MM:SS)
+idle_format = none     # idle duration shown on idle rows: none | loose (minute res, [Nd ]HH:MM) | precise ([Nd ]HH:MM:SS)
 
 [features]
 tray            = true   # systray icon (true | false)
