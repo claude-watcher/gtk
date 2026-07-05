@@ -115,6 +115,7 @@ no need to touch a config file by hand.
 --margin-y PX       vertical margin from corner
 --no-tray           disable systray icon
 --list-screens      print detected monitors and exit
+--settings          open the Settings window on launch
 ```
 
 ## How it works

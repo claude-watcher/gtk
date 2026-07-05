@@ -115,6 +115,7 @@ Réglages) — pas besoin de toucher à un fichier de config à la main.
 --margin-y PX       marge verticale depuis le coin
 --no-tray           désactive l'icône systray
 --list-screens      affiche les monitors détectés et quitte
+--settings          ouvre la fenêtre de paramètres au lancement
 ```
 
 ## Comment ça marche
