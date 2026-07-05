@@ -226,6 +226,7 @@ STRINGS = {
         'close':         'Fermer',
         # menu contextuel (clic droit sur une session) + confirmation de fermeture
         'menu_focus':         'Focus',
+        'menu_copy_pid':      'Copier le PID',
         'menu_kill':          'Fermer la session',
         'kill_confirm_title': 'Fermer la session ?',
         'kill_confirm_body':  'Fermer la session Claude « {proj} » (inactive depuis {idle}) ?\n'
@@ -315,6 +316,7 @@ STRINGS = {
         'close':         'Close',
         # context menu (right-click on a session) + close confirmation
         'menu_focus':         'Focus',
+        'menu_copy_pid':      'Copy PID',
         'menu_kill':          'Close session',
         'kill_confirm_title': 'Close session?',
         'kill_confirm_body':  'Close the Claude session “{proj}” (idle for {idle})?\n'
@@ -1175,6 +1177,11 @@ class SessionRow(Gtk.EventBox):
         self.session  = session
         self._hovered     = False
         self._kb_selected = False
+        self._ctx_menu    = None
+        # La ligne peut être détruite (rebuild de structure) pendant que son menu
+        # contextuel est ouvert : on le referme pour ne pas laisser des entrées
+        # périmées (focus/copie/kill d'une session disparue) activables.
+        self.connect('destroy', self._on_destroyed)
 
         # Survol : chemin de travail complet + sujet complet (les labels tronquent
         # — projet aux 2 derniers segments, sujet à la 1re ligne ellipsée).
@@ -1400,6 +1407,11 @@ class SessionRow(Gtk.EventBox):
             self.session.get('kitty_window_id'),
         )
 
+    def _on_destroyed(self, *_):
+        if self._ctx_menu is not None:
+            self._ctx_menu.popdown()
+            self._ctx_menu = None
+
     def _on_click(self, widget, event):
         if event.button == 1:
             self._do_focus()
@@ -1417,6 +1429,11 @@ class SessionRow(Gtk.EventBox):
         item_focus = Gtk.MenuItem.new_with_label(tr('menu_focus'))
         item_focus.connect('activate', lambda _m: self._do_focus())
         menu.append(item_focus)
+        item_pid = Gtk.MenuItem.new_with_label(f"{tr('menu_copy_pid')} ({s['pid']})")
+        item_pid.connect(
+            'activate',
+            lambda _m: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(str(s['pid']), -1))
+        menu.append(item_pid)
         # « Fermer » réservé aux sessions inactives : on ne propose pas de tuer
         # une session qui travaille ou attend une réponse (tour en cours).
         if not s['waiting'] and not s['working']:

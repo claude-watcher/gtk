@@ -132,8 +132,9 @@ on Wayland.
 
 ### Closing a session
 
-Right-clicking a session row opens a per-row menu (left-click still focuses). For
-an **idle** session it offers *Close session*, which — after a confirmation —
+Right-clicking a session row opens a per-row menu (left-click still focuses). It
+always offers *Focus* and *Copy PID* (puts the `claude` PID on the clipboard). For
+an **idle** session it also offers *Close session*, which — after a confirmation —
 sends `SIGTERM` to the `claude` PID (clean exit, transcript flushed; never
 `SIGKILL`). The terminal itself stays open. The kill is gated by the same
 anti-PID-reuse guard used elsewhere: `kill_session` only fires if
