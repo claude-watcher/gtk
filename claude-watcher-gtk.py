@@ -167,6 +167,8 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
                    help='liste les monitors détectés et quitte.')
     p.add_argument('--dump', action='store_true',
                    help="un tour de calcul d'état (registre vs JSONL vs final) en texte, puis quitte.")
+    p.add_argument('--settings', action='store_true',
+                   help="ouvre directement la fenêtre de paramètres au lancement.")
     args = p.parse_args(argv)
     if (args.x is None) != (args.y is None):
         p.error('--x et --y doivent être fournis ensemble.')
@@ -233,6 +235,9 @@ STRINGS = {
         'tab_about':     'À propos',
         'tab_version':   'Version',
         'tab_credits':   'Crédits',
+        'tab_general':   'Général',
+        'tab_position':  'Position',
+        'tab_display':   'Affichage',
         'authors':       'Auteurs',
         'close':         'Fermer',
         # menu contextuel (clic droit sur une session) + confirmation de fermeture
@@ -247,9 +252,6 @@ STRINGS = {
         'settings_title': 'Paramètres — Claude Code Watcher',
         'cancel':         'Annuler',
         'apply':          'Appliquer',
-        'sec_lang':       'Langue',
-        'sec_position':   'Position',
-        'sec_display':    'Affichage',
         'sec_shortcut':   'Raccourci clavier',
         'fld_shortcut_enable': 'Activer le raccourci',
         'fld_hotkey':     'Raccourci',
@@ -330,6 +332,9 @@ STRINGS = {
         'tab_about':     'About',
         'tab_version':   'Version',
         'tab_credits':   'Credits',
+        'tab_general':   'General',
+        'tab_position':  'Position',
+        'tab_display':   'Display',
         'authors':       'Authors',
         'close':         'Close',
         # context menu (right-click on a session) + close confirmation
@@ -344,9 +349,6 @@ STRINGS = {
         'settings_title': 'Settings — Claude Code Watcher',
         'cancel':         'Cancel',
         'apply':          'Apply',
-        'sec_lang':       'Language',
-        'sec_position':   'Position',
-        'sec_display':    'Display',
         'sec_shortcut':   'Keyboard shortcut',
         'fld_shortcut_enable': 'Enable shortcut',
         'fld_hotkey':     'Shortcut',
@@ -1674,7 +1676,7 @@ class SettingsDialog(Gtk.Dialog):
             # what's on screen, while CFG keeps the base until Apply.
             'bg_alpha':   round(parent._effective_alpha() * 100),
         }
-        self.set_default_size(400, -1)
+        self.set_default_size(500, -1)
         self.set_resizable(False)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.add_button(tr('cancel'), Gtk.ResponseType.CANCEL)
@@ -1682,12 +1684,9 @@ class SettingsDialog(Gtk.Dialog):
         ok_btn.get_style_context().add_class('suggested-action')
 
         content = self.get_content_area()
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        outer.set_margin_start(18)
-        outer.set_margin_end(18)
-        outer.set_margin_top(14)
-        outer.set_margin_bottom(8)
-        content.add(outer)
+        nb = Gtk.Notebook()
+        nb.set_border_width(8)
+        content.add(nb)
 
         def section_label(title: str) -> Gtk.Label:
             lbl = Gtk.Label()
@@ -1703,28 +1702,60 @@ class SettingsDialog(Gtk.Dialog):
             lbl.set_valign(Gtk.Align.CENTER)
             return lbl
 
-        def make_grid() -> Gtk.Grid:
+        def make_page(title_key: str) -> Gtk.Grid:
+            # 6 colonnes logiques : deux blocs [label|champ|unité] côte à côte.
             g = Gtk.Grid()
             g.set_row_spacing(8)
             g.set_column_spacing(10)
-            g.set_margin_start(6)
-            outer.pack_start(g, False, False, 0)
+            g.set_margin_start(14)
+            g.set_margin_end(14)
+            g.set_margin_top(12)
+            g.set_margin_bottom(12)
+            nb.append_page(g, Gtk.Label(label=tr(title_key)))
             return g
 
-        # ── Langue ──────────────────────────────────────────────────────────
-        outer.pack_start(section_label(tr('sec_lang')), False, False, 0)
-        g0 = make_grid()
-        g0.attach(field_label(tr('fld_lang')), 0, 0, 1, 1)
+        # ── Onglet Général : langue, timings, raccourci ─────────────────────
+        gg = make_page('tab_general')
+
+        gg.attach(field_label(tr('fld_lang')), 0, 0, 1, 1)
         self._lang_combo = Gtk.ComboBoxText()
         self._lang_combo.append('fr', tr('lang_fr'))
         self._lang_combo.append('en', tr('lang_en'))
         self._lang_combo.set_active_id(CFG.lang)
-        g0.attach(self._lang_combo, 1, 0, 2, 1)
+        gg.attach(self._lang_combo, 1, 0, 2, 1)
 
-        # ── Position ─────────────────────────────────────────────────────────
-        outer.pack_start(Gtk.Separator(), False, False, 0)
-        outer.pack_start(section_label(tr('sec_position')), False, False, 0)
-        g1 = make_grid()
+        gg.attach(field_label(tr('fld_refresh')), 0, 1, 1, 1)
+        self._spin_refresh = Gtk.SpinButton.new_with_range(500, 10000, 500)
+        self._spin_refresh.set_value(CFG.refresh_ms)
+        gg.attach(self._spin_refresh, 1, 1, 1, 1)
+        gg.attach(Gtk.Label(label="ms"), 2, 1, 1, 1)
+
+        gg.attach(field_label(tr('fld_snooze')), 3, 1, 1, 1)
+        self._spin_snooze = Gtk.SpinButton.new_with_range(10, 3600, 10)
+        self._spin_snooze.set_value(CFG.snooze_sec)
+        gg.attach(self._spin_snooze, 4, 1, 1, 1)
+        gg.attach(Gtk.Label(label="s"), 5, 1, 1, 1)
+
+        gg.attach(Gtk.Separator(), 0, 2, 6, 1)
+        gg.attach(section_label(tr('sec_shortcut')), 0, 3, 6, 1)
+
+        self._chk_shortcut = Gtk.CheckButton(label=tr('fld_shortcut_enable'))
+        self._chk_shortcut.set_active(CFG.shortcut_enable)
+        gg.attach(self._chk_shortcut, 0, 4, 6, 1)
+
+        gg.attach(field_label(tr('fld_hotkey')), 0, 5, 1, 1)
+        self._entry_hotkey = Gtk.Entry()
+        self._entry_hotkey.set_text(CFG.hotkey)
+        self._entry_hotkey.set_placeholder_text(tr('hotkey_hint'))
+        self._entry_hotkey.set_tooltip_text(tr('hotkey_hint'))
+        gg.attach(self._entry_hotkey, 1, 5, 5, 1)
+        # Hotkey/enable take effect only on Apply (no live rebinding preview).
+        self._chk_shortcut.connect(
+            'toggled', lambda c: self._entry_hotkey.set_sensitive(c.get_active()))
+        self._entry_hotkey.set_sensitive(CFG.shortcut_enable)
+
+        # ── Onglet Position ──────────────────────────────────────────────────
+        gp = make_page('tab_position')
 
         mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
         self._radio_corner = Gtk.RadioButton(label=tr('mode_corner'))
@@ -1732,10 +1763,10 @@ class SettingsDialog(Gtk.Dialog):
             self._radio_corner, tr('mode_free'))
         mode_box.pack_start(self._radio_corner, False, False, 0)
         mode_box.pack_start(self._radio_free,   False, False, 0)
-        g1.attach(field_label(tr('fld_mode')), 0, 0, 1, 1)
-        g1.attach(mode_box, 1, 0, 2, 1)
+        gp.attach(field_label(tr('fld_mode')), 0, 0, 1, 1)
+        gp.attach(mode_box, 1, 0, 5, 1)
 
-        g1.attach(field_label(tr('fld_screen')), 0, 1, 1, 1)
+        gp.attach(field_label(tr('fld_screen')), 0, 1, 1, 1)
         self._screen_combo = Gtk.ComboBoxText()
         self._cfg_screen = CFG.screen  # valeur configurée, potentiellement hors-range
         display = Gdk.Display.get_default()
@@ -1755,9 +1786,9 @@ class SettingsDialog(Gtk.Dialog):
         else:
             self._screen_user_changed = True  # l'écran est présent, toute valeur est valide
         self._screen_combo.connect('changed', lambda _w: setattr(self, '_screen_user_changed', True))
-        g1.attach(self._screen_combo, 1, 1, 2, 1)
+        gp.attach(self._screen_combo, 1, 1, 5, 1)
 
-        g1.attach(field_label(tr('fld_corner')), 0, 2, 1, 1)
+        gp.attach(field_label(tr('fld_corner')), 0, 2, 1, 1)
         self._corner_combo = Gtk.ComboBoxText()
         for val, key in [
             ('bottom-right', 'corner_br'),
@@ -1767,19 +1798,19 @@ class SettingsDialog(Gtk.Dialog):
         ]:
             self._corner_combo.append(val, tr(key))
         self._corner_combo.set_active_id(CFG.corner)
-        g1.attach(self._corner_combo, 1, 2, 2, 1)
+        gp.attach(self._corner_combo, 1, 2, 2, 1)
 
-        g1.attach(field_label(tr('fld_margin_x')), 0, 3, 1, 1)
+        gp.attach(field_label(tr('fld_margin_x')), 0, 3, 1, 1)
         self._spin_mx = Gtk.SpinButton.new_with_range(0, 500, 1)
         self._spin_mx.set_value(CFG.margin_x)
-        g1.attach(self._spin_mx, 1, 3, 1, 1)
-        g1.attach(Gtk.Label(label="px"), 2, 3, 1, 1)
+        gp.attach(self._spin_mx, 1, 3, 1, 1)
+        gp.attach(Gtk.Label(label="px"), 2, 3, 1, 1)
 
-        g1.attach(field_label(tr('fld_margin_y')), 0, 4, 1, 1)
+        gp.attach(field_label(tr('fld_margin_y')), 3, 3, 1, 1)
         self._spin_my = Gtk.SpinButton.new_with_range(0, 500, 1)
         self._spin_my.set_value(CFG.margin_y)
-        g1.attach(self._spin_my, 1, 4, 1, 1)
-        g1.attach(Gtk.Label(label="px"), 2, 4, 1, 1)
+        gp.attach(self._spin_my, 4, 3, 1, 1)
+        gp.attach(Gtk.Label(label="px"), 5, 3, 1, 1)
 
         is_free = parent._user_pos is not None
         if is_free:
@@ -1792,64 +1823,39 @@ class SettingsDialog(Gtk.Dialog):
             w.set_sensitive(not is_free)
         self._radio_corner.connect('toggled', self._on_mode_toggled)
 
-        # ── Affichage ────────────────────────────────────────────────────────
-        outer.pack_start(Gtk.Separator(), False, False, 0)
-        outer.pack_start(section_label(tr('sec_display')), False, False, 0)
-        g2 = make_grid()
+        # ── Onglet Affichage ─────────────────────────────────────────────────
+        gd = make_page('tab_display')
 
+        # Toggles groupés sur deux colonnes.
         self._chk_auto_width = Gtk.CheckButton(label=tr('fld_auto_width'))
         self._chk_auto_width.set_active(CFG.auto_width)
-        g2.attach(self._chk_auto_width, 0, 0, 3, 1)
+        gd.attach(self._chk_auto_width, 0, 0, 3, 1)
 
         self._chk_show_topic = Gtk.CheckButton(label=tr('fld_show_topic'))
         self._chk_show_topic.set_active(getattr(CFG, 'show_topic', True))
-        g2.attach(self._chk_show_topic, 0, 5, 3, 1)
-
-        # Toggles de fonctionnalité groupés avec show_topic, avant les champs
-        # numériques colonnes/hauteur/tri (rows 8+).
-        self._chk_show_agents = Gtk.CheckButton(label=tr('fld_show_agents'))
-        self._chk_show_agents.set_active(getattr(CFG, 'show_agents', True))
-        g2.attach(self._chk_show_agents, 0, 6, 3, 1)
+        gd.attach(self._chk_show_topic, 3, 0, 3, 1)
 
         self._chk_hide_daemons = Gtk.CheckButton(label=tr('fld_hide_daemons'))
         self._chk_hide_daemons.set_active(getattr(CFG, 'hide_daemons', False))
-        g2.attach(self._chk_hide_daemons, 0, 7, 3, 1)
+        gd.attach(self._chk_hide_daemons, 0, 1, 3, 1)
+
+        self._chk_show_agents = Gtk.CheckButton(label=tr('fld_show_agents'))
+        self._chk_show_agents.set_active(getattr(CFG, 'show_agents', True))
+        gd.attach(self._chk_show_agents, 3, 1, 3, 1)
+
+        gd.attach(Gtk.Separator(), 0, 2, 6, 1)
 
         self._lbl_width = field_label(tr('fld_width'))
-        g2.attach(self._lbl_width, 0, 1, 1, 1)
+        gd.attach(self._lbl_width, 0, 3, 1, 1)
         self._spin_width = Gtk.SpinButton.new_with_range(200, 800, 10)
         self._spin_width.set_value(CFG.width)
-        g2.attach(self._spin_width, 1, 1, 1, 1)
-        g2.attach(Gtk.Label(label="px"), 2, 1, 1, 1)
+        gd.attach(self._spin_width, 1, 3, 1, 1)
+        gd.attach(Gtk.Label(label="px"), 2, 3, 1, 1)
 
-        g2.attach(field_label(tr('fld_refresh')), 0, 2, 1, 1)
-        self._spin_refresh = Gtk.SpinButton.new_with_range(500, 10000, 500)
-        self._spin_refresh.set_value(CFG.refresh_ms)
-        g2.attach(self._spin_refresh, 1, 2, 1, 1)
-        g2.attach(Gtk.Label(label="ms"), 2, 2, 1, 1)
-
-        g2.attach(field_label(tr('fld_snooze')), 0, 3, 1, 1)
-        self._spin_snooze = Gtk.SpinButton.new_with_range(10, 3600, 10)
-        self._spin_snooze.set_value(CFG.snooze_sec)
-        g2.attach(self._spin_snooze, 1, 3, 1, 1)
-        g2.attach(Gtk.Label(label="s"), 2, 3, 1, 1)
-
-        g2.attach(field_label(tr('fld_bg_alpha')), 0, 4, 1, 1)
-        # 20 floor mirrors _set_effective_alpha — lower values would silently snap
-        self._spin_bg_alpha = Gtk.SpinButton.new_with_range(20, 100, 1)
-        self._spin_bg_alpha.set_value(round(parent._effective_alpha() * 100))
-        g2.attach(self._spin_bg_alpha, 1, 4, 1, 1)
-        g2.attach(Gtk.Label(label="%"), 2, 4, 1, 1)
-        btn_bg_default = Gtk.Button(label=f"{tr('btn_default')} ({BG_ALPHA_DEFAULT})")
-        # set_value fires value-changed → live preview updates immediately
-        btn_bg_default.connect(
-            'clicked', lambda _b: self._spin_bg_alpha.set_value(BG_ALPHA_DEFAULT))
-        g2.attach(btn_bg_default, 3, 4, 1, 1)
-
-        g2.attach(field_label(tr('fld_columns')), 0, 8, 1, 1)
+        gd.attach(field_label(tr('fld_columns')), 3, 3, 1, 1)
         self._spin_columns = Gtk.SpinButton.new_with_range(1, 6, 1)
         self._spin_columns.set_value(getattr(CFG, 'columns', 1))
-        g2.attach(self._spin_columns, 1, 8, 1, 1)
+        gd.attach(self._spin_columns, 4, 3, 1, 1)
 
         # Label « Hauteur max » + icône info (tooltip explicatif au survol) plutôt
         # qu'un « (0 = écran) » accolé : plus lisible, l'explication complète tient
@@ -1862,47 +1868,41 @@ class SettingsDialog(Gtk.Dialog):
         mh_info.set_tooltip_text(tr('help_max_height'))
         mh_lbl_box.pack_start(mh_lbl,  False, False, 0)
         mh_lbl_box.pack_start(mh_info, False, False, 0)
-        g2.attach(mh_lbl_box, 0, 9, 1, 1)
+        gd.attach(mh_lbl_box, 0, 4, 1, 1)
         # 0 = pas de limite propre (l'écran borne) ; pas-50 px ; plafond large.
         self._spin_max_height = Gtk.SpinButton.new_with_range(0, 4000, 50)
         self._spin_max_height.set_value(getattr(CFG, 'max_height', 0))
-        g2.attach(self._spin_max_height, 1, 9, 1, 1)
-        g2.attach(Gtk.Label(label="px"), 2, 9, 1, 1)
+        gd.attach(self._spin_max_height, 1, 4, 1, 1)
+        gd.attach(Gtk.Label(label="px"), 2, 4, 1, 1)
 
-        g2.attach(field_label(tr('fld_sort')), 0, 10, 1, 1)
+        gd.attach(field_label(tr('fld_bg_alpha')), 0, 5, 1, 1)
+        # 20 floor mirrors _set_effective_alpha — lower values would silently snap
+        self._spin_bg_alpha = Gtk.SpinButton.new_with_range(20, 100, 1)
+        self._spin_bg_alpha.set_value(round(parent._effective_alpha() * 100))
+        gd.attach(self._spin_bg_alpha, 1, 5, 1, 1)
+        gd.attach(Gtk.Label(label="%"), 2, 5, 1, 1)
+        btn_bg_default = Gtk.Button(label=f"{tr('btn_default')} ({BG_ALPHA_DEFAULT})")
+        # set_value fires value-changed → live preview updates immediately
+        btn_bg_default.connect(
+            'clicked', lambda _b: self._spin_bg_alpha.set_value(BG_ALPHA_DEFAULT))
+        gd.attach(btn_bg_default, 3, 5, 2, 1)
+
+        gd.attach(Gtk.Separator(), 0, 6, 6, 1)
+
+        gd.attach(field_label(tr('fld_sort')), 0, 7, 1, 1)
         self._combo_sort = Gtk.ComboBoxText()
         self._combo_sort.append('default', tr('sort_default'))
         self._combo_sort.append('idle',    tr('sort_idle'))
         self._combo_sort.set_active_id(getattr(CFG, 'sort_mode', 'default'))
-        g2.attach(self._combo_sort, 1, 10, 2, 1)
+        gd.attach(self._combo_sort, 1, 7, 4, 1)
 
-        g2.attach(field_label(tr('fld_idle_format')), 0, 11, 1, 1)
+        gd.attach(field_label(tr('fld_idle_format')), 0, 8, 1, 1)
         self._combo_idle = Gtk.ComboBoxText()
         self._combo_idle.append('none',    tr('idle_none'))
         self._combo_idle.append('loose',   tr('idle_loose'))
         self._combo_idle.append('precise', tr('idle_precise'))
         self._combo_idle.set_active_id(getattr(CFG, 'idle_format', 'none'))
-        g2.attach(self._combo_idle, 1, 11, 2, 1)
-
-        # ── Raccourci clavier ────────────────────────────────────────────────
-        outer.pack_start(Gtk.Separator(), False, False, 0)
-        outer.pack_start(section_label(tr('sec_shortcut')), False, False, 0)
-        g3 = make_grid()
-
-        self._chk_shortcut = Gtk.CheckButton(label=tr('fld_shortcut_enable'))
-        self._chk_shortcut.set_active(CFG.shortcut_enable)
-        g3.attach(self._chk_shortcut, 0, 0, 3, 1)
-
-        g3.attach(field_label(tr('fld_hotkey')), 0, 1, 1, 1)
-        self._entry_hotkey = Gtk.Entry()
-        self._entry_hotkey.set_text(CFG.hotkey)
-        self._entry_hotkey.set_placeholder_text(tr('hotkey_hint'))
-        self._entry_hotkey.set_tooltip_text(tr('hotkey_hint'))
-        g3.attach(self._entry_hotkey, 1, 1, 2, 1)
-        # Hotkey/enable take effect only on Apply (no live rebinding preview).
-        self._chk_shortcut.connect(
-            'toggled', lambda c: self._entry_hotkey.set_sensitive(c.get_active()))
-        self._entry_hotkey.set_sensitive(CFG.shortcut_enable)
+        gd.attach(self._combo_idle, 1, 8, 4, 1)
 
         # Live preview — connecté après les set_active_id/set_value initiaux
         for widget, signal in [
@@ -3405,6 +3405,12 @@ def main():
         return
     app = ClaudeWatcher(CFG)
     app.show_all()
+    # Ouvrir les paramètres une fois la fenêtre mappée et la boucle démarrée :
+    # _open_settings/_preview_settings s'appuient sur une fenêtre réalisée.
+    # Retour False explicite : source idle à usage unique (ne pas ré-armer la
+    # nested main loop de _open_settings quel que soit son futur retour).
+    if CFG.settings:
+        GLib.idle_add(lambda: (app._open_settings(), False)[1])
     Gtk.main()
 
 
