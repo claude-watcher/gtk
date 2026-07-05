@@ -281,7 +281,11 @@ STRINGS = {
         'idle_loose':      'Approx. (HH:MM)',
         'idle_precise':    'Précise (1d 02:24:23)',
         'fld_refresh':    'Rafraîch.',
+        'help_refresh':   ('Intervalle entre deux scans des sessions Claude et '
+                           'mises à jour de l’affichage, en millisecondes.'),
         'fld_snooze':     'Veille',
+        'help_snooze':    ('Durée pendant laquelle le widget reste masqué après '
+                           '« Masquer pendant » (menu / clic milieu), en secondes.'),
         'fld_bg_alpha':   'Opacité',
         'btn_default':    'Défaut',
         'mode_corner':    'Ancrée au coin',
@@ -377,7 +381,11 @@ STRINGS = {
         'idle_loose':      'Approx. (HH:MM)',
         'idle_precise':    'Precise (1d 02:24:23)',
         'fld_refresh':    'Refresh',
+        'help_refresh':   ('Interval between two scans of Claude sessions and '
+                           'display updates, in milliseconds.'),
         'fld_snooze':     'Snooze',
+        'help_snooze':    ('How long the widget stays hidden after "Hide for" '
+                           '(menu / middle-click), in seconds.'),
         'fld_bg_alpha':   'Opacity',
         'btn_default':    'Default',
         'mode_corner':    'Anchored to corner',
@@ -1708,6 +1716,17 @@ class SettingsDialog(Gtk.Dialog):
             w.set_margin_start(22)
             return w
 
+        def info_label(text: str, tooltip: str) -> Gtk.Box:
+            # Label + icône info (explication au survol), aligné comme field_label.
+            box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+            box.set_halign(Gtk.Align.END)
+            box.set_valign(Gtk.Align.CENTER)
+            box.pack_start(Gtk.Label(label=text), False, False, 0)
+            icon = Gtk.Image.new_from_icon_name('dialog-information-symbolic', Gtk.IconSize.MENU)
+            icon.set_tooltip_text(tooltip)
+            box.pack_start(icon, False, False, 0)
+            return box
+
         def make_page(title_key: str) -> Gtk.Grid:
             # 6 colonnes logiques : deux blocs [label|champ|unité] côte à côte.
             g = Gtk.Grid()
@@ -1730,13 +1749,13 @@ class SettingsDialog(Gtk.Dialog):
         self._lang_combo.set_active_id(CFG.lang)
         gg.attach(self._lang_combo, 1, 0, 2, 1)
 
-        gg.attach(field_label(tr('fld_refresh')), 0, 1, 1, 1)
+        gg.attach(info_label(tr('fld_refresh'), tr('help_refresh')), 0, 1, 1, 1)
         self._spin_refresh = Gtk.SpinButton.new_with_range(500, 10000, 500)
         self._spin_refresh.set_value(CFG.refresh_ms)
         gg.attach(self._spin_refresh, 1, 1, 1, 1)
         gg.attach(Gtk.Label(label="ms"), 2, 1, 1, 1)
 
-        gg.attach(gutter(field_label(tr('fld_snooze'))), 3, 1, 1, 1)
+        gg.attach(gutter(info_label(tr('fld_snooze'), tr('help_snooze'))), 3, 1, 1, 1)
         self._spin_snooze = Gtk.SpinButton.new_with_range(10, 3600, 10)
         self._spin_snooze.set_value(CFG.snooze_sec)
         gg.attach(self._spin_snooze, 4, 1, 1, 1)
@@ -1863,18 +1882,9 @@ class SettingsDialog(Gtk.Dialog):
         self._spin_columns.set_value(getattr(CFG, 'columns', 1))
         gd.attach(self._spin_columns, 4, 3, 1, 1)
 
-        # Label « Hauteur max » + icône info (tooltip explicatif au survol) plutôt
-        # qu'un « (0 = écran) » accolé : plus lisible, l'explication complète tient
-        # dans le tooltip.
-        mh_lbl_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
-        mh_lbl_box.set_halign(Gtk.Align.END)
-        mh_lbl_box.set_valign(Gtk.Align.CENTER)
-        mh_lbl = Gtk.Label(label=tr('fld_max_height'))
-        mh_info = Gtk.Image.new_from_icon_name('dialog-information-symbolic', Gtk.IconSize.MENU)
-        mh_info.set_tooltip_text(tr('help_max_height'))
-        mh_lbl_box.pack_start(mh_lbl,  False, False, 0)
-        mh_lbl_box.pack_start(mh_info, False, False, 0)
-        gd.attach(mh_lbl_box, 0, 4, 1, 1)
+        # « Hauteur max » : icône info (tooltip au survol) plutôt qu'un « (0 = écran) »
+        # accolé — l'explication complète tient dans le tooltip.
+        gd.attach(info_label(tr('fld_max_height'), tr('help_max_height')), 0, 4, 1, 1)
         # 0 = pas de limite propre (l'écran borne) ; pas-50 px ; plafond large.
         self._spin_max_height = Gtk.SpinButton.new_with_range(0, 4000, 50)
         self._spin_max_height.set_value(getattr(CFG, 'max_height', 0))
