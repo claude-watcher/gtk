@@ -1702,6 +1702,12 @@ class SettingsDialog(Gtk.Dialog):
             lbl.set_valign(Gtk.Align.CENTER)
             return lbl
 
+        # Respiration entre les deux blocs de colonnes appariés : marge à gauche
+        # du premier widget du bloc droit (col 3), sinon les deux blocs se collent.
+        def gutter(w: Gtk.Widget) -> Gtk.Widget:
+            w.set_margin_start(22)
+            return w
+
         def make_page(title_key: str) -> Gtk.Grid:
             # 6 colonnes logiques : deux blocs [label|champ|unité] côte à côte.
             g = Gtk.Grid()
@@ -1730,7 +1736,7 @@ class SettingsDialog(Gtk.Dialog):
         gg.attach(self._spin_refresh, 1, 1, 1, 1)
         gg.attach(Gtk.Label(label="ms"), 2, 1, 1, 1)
 
-        gg.attach(field_label(tr('fld_snooze')), 3, 1, 1, 1)
+        gg.attach(gutter(field_label(tr('fld_snooze'))), 3, 1, 1, 1)
         self._spin_snooze = Gtk.SpinButton.new_with_range(10, 3600, 10)
         self._spin_snooze.set_value(CFG.snooze_sec)
         gg.attach(self._spin_snooze, 4, 1, 1, 1)
@@ -1806,7 +1812,7 @@ class SettingsDialog(Gtk.Dialog):
         gp.attach(self._spin_mx, 1, 3, 1, 1)
         gp.attach(Gtk.Label(label="px"), 2, 3, 1, 1)
 
-        gp.attach(field_label(tr('fld_margin_y')), 3, 3, 1, 1)
+        gp.attach(gutter(field_label(tr('fld_margin_y'))), 3, 3, 1, 1)
         self._spin_my = Gtk.SpinButton.new_with_range(0, 500, 1)
         self._spin_my.set_value(CFG.margin_y)
         gp.attach(self._spin_my, 4, 3, 1, 1)
@@ -1833,7 +1839,7 @@ class SettingsDialog(Gtk.Dialog):
 
         self._chk_show_topic = Gtk.CheckButton(label=tr('fld_show_topic'))
         self._chk_show_topic.set_active(getattr(CFG, 'show_topic', True))
-        gd.attach(self._chk_show_topic, 3, 0, 3, 1)
+        gd.attach(gutter(self._chk_show_topic), 3, 0, 3, 1)
 
         self._chk_hide_daemons = Gtk.CheckButton(label=tr('fld_hide_daemons'))
         self._chk_hide_daemons.set_active(getattr(CFG, 'hide_daemons', False))
@@ -1841,7 +1847,7 @@ class SettingsDialog(Gtk.Dialog):
 
         self._chk_show_agents = Gtk.CheckButton(label=tr('fld_show_agents'))
         self._chk_show_agents.set_active(getattr(CFG, 'show_agents', True))
-        gd.attach(self._chk_show_agents, 3, 1, 3, 1)
+        gd.attach(gutter(self._chk_show_agents), 3, 1, 3, 1)
 
         gd.attach(Gtk.Separator(), 0, 2, 6, 1)
 
@@ -1852,7 +1858,7 @@ class SettingsDialog(Gtk.Dialog):
         gd.attach(self._spin_width, 1, 3, 1, 1)
         gd.attach(Gtk.Label(label="px"), 2, 3, 1, 1)
 
-        gd.attach(field_label(tr('fld_columns')), 3, 3, 1, 1)
+        gd.attach(gutter(field_label(tr('fld_columns'))), 3, 3, 1, 1)
         self._spin_columns = Gtk.SpinButton.new_with_range(1, 6, 1)
         self._spin_columns.set_value(getattr(CFG, 'columns', 1))
         gd.attach(self._spin_columns, 4, 3, 1, 1)
@@ -1885,7 +1891,7 @@ class SettingsDialog(Gtk.Dialog):
         # set_value fires value-changed → live preview updates immediately
         btn_bg_default.connect(
             'clicked', lambda _b: self._spin_bg_alpha.set_value(BG_ALPHA_DEFAULT))
-        gd.attach(btn_bg_default, 3, 5, 2, 1)
+        gd.attach(gutter(btn_bg_default), 3, 5, 2, 1)
 
         gd.attach(Gtk.Separator(), 0, 6, 6, 1)
 
