@@ -26,6 +26,8 @@ idle_format = none     # idle duration shown on idle rows: none | loose (minute 
 tray            = true   # systray icon (true | false)
 shortcut_enable = true   # global show/hide hotkey (true | false)
 show_topic      = true   # per-row session topic subtitle (true | false)
+show_agents     = true   # per-row spawned-subagent count + tooltip list (true | false)
+hide_daemons    = false  # hide the Claude Code background daemon rows (true | false)
 ```
 
 CLI flags (see the README) override these at launch. The free-drag position is
@@ -49,9 +51,10 @@ and idle time work), labels the row with the real project name, and adds a
 `↳ WT: <name>` sub-line. When the parent transcript can't be confirmed it leaves
 the raw label untouched.
 
-1. The widget enumerates sessions by scanning `/proc/<pid>/comm` for an exact
-   match on `claude`; field 22 of `/proc/<pid>/stat` gives the process
-   `starttime` (in ticks).
+1. A single `/proc` pass enumerates both sessions and subagents. Sessions are
+   `/proc/<pid>/comm` exact-matching `claude`; field 22 of `/proc/<pid>/stat`
+   gives the process `starttime` (in ticks). The same pass also collects
+   **subagents** (see step 7).
 2. **State (registry, when present)** — `~/.claude/sessions/<pid>.json` carries a
    `status` field updated in real time:
    - `busy` / `shell` / `compacting` → **working**
@@ -85,6 +88,21 @@ the raw label untouched.
    ellipsizes; hovering the row shows the full `cwd` and full topic in a tooltip.
 6. Walk the process tree to find the parent terminal window (ghostty, kitty,
    alacritty, gnome-terminal…).
+7. **Subagents** (`Task`-tool background agents, swarm teammates) run the
+   *versioned* binary (`comm` is the version string, not `claude`), so they are
+   not sessions and are never listed as focusable rows. They are matched by their
+   exact `--agent-id` / `--parent-session-id` argv tokens and grouped by parent
+   `sessionId`. A session that has spawned any shows an `N agents` count under its
+   state badge, and the row tooltip lists each (`name`, agent type, model). This
+   is optional (`features.show_agents`, on by default); when off, the detection
+   scan is skipped entirely (no cmdline reads for non-`claude` processes).
+
+The **background daemon** (`claude daemon run …`) runs the *same* `claude` binary
+(so `comm` also matches `claude`) and only differs by its subcommand. It is not a
+session — it has no pid-keyed registry, terminal, or transcript — so its row is
+marked with a `(D)` prefix, rendered with a neutral state, and excluded from the
+"Close session" action. Set `features.hide_daemons = true` to omit daemon rows
+entirely.
 
 The terminal-title spinner is **not** used for state — only to pick the right
 window when focusing a multi-window terminal.

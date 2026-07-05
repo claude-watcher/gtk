@@ -16,6 +16,8 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
   - **Working** (amber) — Claude is processing your message, with tool name
   - **Idle** (green) — session paused
 - Context window usage (`ctx%`) shown when available
+- Spawned subagent count per session (`N agents`), with each agent detailed in the row tooltip — toggle off in settings
+- Background daemon shown as a non-focusable `(D)` row (hideable in settings)
 - Click a session row to focus its terminal window
 - Right-click a session row for its menu (focus, copy the PID, or close an idle session — sends `SIGTERM`)
 - Right-click the header for the global context menu (show/hide, snooze, settings, quit)
