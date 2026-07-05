@@ -218,10 +218,15 @@ else
 # refresh_ms = 2000
 # snooze_sec = 30            # snooze duration in seconds
 # bg_alpha   = 88            # opacity in % (20-100)
+# sort_mode   = default      # default | idle (state then most-recently-idle first)
+# idle_format = none         # idle duration on idle rows: none | loose | precise
 
 [features]
 # tray            = true
 # shortcut_enable = true
+# show_topic      = true     # per-row session topic subtitle
+# show_agents     = true     # per-row spawned-subagent count + tooltip list
+# hide_daemons    = false    # hide the Claude Code background daemon rows
 EOF
     echo "  ~/.config/claude-watcher/config.ini"
 fi

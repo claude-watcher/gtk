@@ -131,6 +131,10 @@ def load_config() -> dict:
         'sort_mode':  'idle' if d.get('sort_mode', 'default').lower() == 'idle' else 'default',
         'idle_format': idle_fmt if idle_fmt in ('none', 'loose', 'precise') else 'none',
         'show_topic': f.get('show_topic', 'true').lower() == 'true',
+        # Compteur/détail des subagents lancés : affiché par défaut.
+        'show_agents': f.get('show_agents', 'true').lower() == 'true',
+        # Démon Claude Code : affiché par défaut, balisé (D) ; masquable ici.
+        'hide_daemons': f.get('hide_daemons', 'false').lower() == 'true',
         'refresh_ms': int(d.get('refresh_ms', 2000)),
         'snooze_sec': int(d.get('snooze_sec', 30)),
         'bg_alpha':   _parse_bg_alpha(d.get('bg_alpha', BG_ALPHA_DEFAULT)),
@@ -176,6 +180,8 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
     args.sort_mode   = defaults['sort_mode']
     args.idle_format = defaults['idle_format']
     args.show_topic = defaults['show_topic']
+    args.show_agents = defaults['show_agents']
+    args.hide_daemons = defaults['hide_daemons']
     args.refresh_ms = defaults['refresh_ms']
     args.snooze_sec        = defaults['snooze_sec']
     args.bg_alpha          = defaults['bg_alpha']
@@ -199,6 +205,11 @@ STRINGS = {
         'no_session': 'aucune session active',
         'attend':     'attend',
         'pid':        'pid',
+        'agent':      'agent',
+        'agents':     'agents',
+        'tip_agents': 'Agents :',
+        'daemon':     'démon',
+        'tip_daemon': 'Démon Claude Code (pas une session).',
         # systray
         'settings_menu': 'Paramètres…',
         'show':          'Afficher',
@@ -258,6 +269,8 @@ STRINGS = {
                             'Une valeur > 0 plafonne en plus à ce nombre de pixels ; '
                             'au-delà, la liste des sessions défile.'),
         'fld_show_topic': 'Afficher le sujet de session',
+        'fld_show_agents': 'Afficher les sous-agents',
+        'fld_hide_daemons': 'Masquer les démons',
         'fld_sort':        'Tri',
         'sort_default':    'Par défaut (projet)',
         'sort_idle':       'Par inactivité',
@@ -289,6 +302,11 @@ STRINGS = {
         'no_session': 'no active session',
         'attend':     'waiting',
         'pid':        'pid',
+        'agent':      'agent',
+        'agents':     'agents',
+        'tip_agents': 'Agents:',
+        'daemon':     'daemon',
+        'tip_daemon': 'Claude Code daemon (not a session).',
         # systray
         'settings_menu': 'Settings…',
         'show':          'Show',
@@ -347,6 +365,8 @@ STRINGS = {
                             'the screen size anyway. A value > 0 additionally caps '
                             'it to that many pixels; beyond it, the session list scrolls.'),
         'fld_show_topic': 'Show session topic',
+        'fld_show_agents': 'Show subagents',
+        'fld_hide_daemons': 'Hide daemons',
         'fld_sort':        'Sort',
         'sort_default':    'Default (project)',
         'sort_idle':       'By idle time',
@@ -435,37 +455,112 @@ _STATUS_MAP = {
 _CLK_TCK = os.sysconf('SC_CLK_TCK')
 
 
-def get_claude_processes() -> list[dict]:
-    """Énumère les process 'claude' via /proc — pas de fork ps à chaque tick.
+def _argv_value(argv: list[str], flag: str) -> str | None:
+    """Valeur suivant `flag` dans une argv (cmdline splitée sur NUL), sinon None.
 
-    elapsed = uptime − starttime, où starttime est le champ 22 de
-    /proc/<pid>/stat (ticks d'horloge depuis le boot). Cohérent avec le reste
-    du code, qui lit déjà cwd/status/environ/wchan dans /proc.
+    Vide → None (`or None`). Flag absent ou en dernière position → None.
+    """
+    try:
+        return argv[argv.index(flag) + 1] or None
+    except (ValueError, IndexError):
+        return None
+
+
+def scan_proc(collect_agents: bool = True) -> tuple[list[dict], dict[str, list[dict]]]:
+    """Une seule passe /proc → (sessions/démons 'claude', subagents par parent).
+
+    Les deux consommateurs devaient chacun énumérer /proc ; on le fait UNE fois
+    par tick au lieu de deux. Une session interactive et le démon partagent
+    comm=='claude' (le démon ne se distingue que par `claude daemon run …`) ;
+    un subagent lancé (Task/essaim) tourne le binaire versionné (comm=version,
+    donc invisible au filtre comm) et se repère à ses tokens argv exacts
+    `--agent-id`/`--parent-session-id` — match sur token exact (argv NUL-splitée)
+    pour éviter les faux positifs d'un substring noyé dans un plus gros argument.
+
+    `collect_agents=False` (feature désactivée) saute entièrement la détection des
+    subagents : aucun cmdline lu pour les process non-'claude' → zéro surcoût.
+
+    elapsed = uptime − starttime (champ 22 de /proc/<pid>/stat, ticks depuis le
+    boot). comm est lu EN PREMIER : un échec de lecture cmdline ne fait jamais
+    perdre une session claude (elle est juste traitée comme non-démon).
     """
     try:
         uptime = float(Path('/proc/uptime').read_text().split()[0])
     except Exception:
-        return []
-    procs = []
+        return [], {}
+    procs: list[dict] = []
+    agents: dict[str, list[dict]] = {}
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
             continue
         try:
             # comm est tronqué à 15 car (TASK_COMM_LEN) — 'claude' y tient.
-            if (entry / 'comm').read_text().strip() != 'claude':
-                continue
-            stat = (entry / 'stat').read_text()
-            # Le champ 2 (comm) est entre parenthèses et peut contenir des
-            # espaces ; parser après le dernier ')' réaligne les index.
-            fields = stat[stat.rindex(')') + 2:].split()
-            starttime = int(fields[19])  # champ 22 global = index 19 après comm
-            elapsed = int(uptime - starttime / _CLK_TCK)
-            start_unix = time.time() - elapsed
-        except Exception:
+            # read_bytes+decode(errors='ignore') : un comm non-UTF-8 (nom posé via
+            # prctl par un process quelconque) lèverait UnicodeDecodeError avec
+            # read_text() — PAS un OSError → crash du scan à chaque tick.
+            comm = (entry / 'comm').read_bytes().decode(errors='ignore').strip()
+        except OSError:
             continue
-        procs.append({'pid': int(entry.name), 'elapsed': elapsed,
-                      'start_unix': start_unix, 'starttime': starttime})
-    return procs
+        if comm == 'claude':
+            try:
+                stat = (entry / 'stat').read_text()
+                # Le champ 2 (comm) est entre parenthèses et peut contenir des
+                # espaces ; parser après le dernier ')' réaligne les index.
+                fields = stat[stat.rindex(')') + 2:].split()
+                starttime = int(fields[19])  # champ 22 global = index 19 après comm
+                elapsed = int(uptime - starttime / _CLK_TCK)
+            except Exception:
+                continue
+            # cmdline seulement pour distinguer le démon ; illisible (course avec
+            # un exec/exit) → non-démon, on ne perd pas la session pour autant.
+            try:
+                argv = (entry / 'cmdline').read_bytes().decode(errors='ignore').split('\0')
+            except OSError:
+                argv = []
+            procs.append({'pid': int(entry.name), 'elapsed': elapsed,
+                          'start_unix': time.time() - elapsed, 'starttime': starttime,
+                          'is_daemon': len(argv) > 1 and argv[1] == 'daemon'})
+            continue
+        if not collect_agents:
+            continue
+        # Subagent : comm ≠ 'claude', on doit lire cmdline pour le repérer.
+        try:
+            argv = (entry / 'cmdline').read_bytes().decode(errors='ignore').split('\0')
+        except OSError:
+            continue
+        if '--agent-id' not in argv:
+            continue
+        parent = _argv_value(argv, '--parent-session-id')
+        if not parent:
+            continue
+        # --agent-name peut manquer (agents anonymes) : repli sur la partie locale
+        # de l'id (<name>@<team>).
+        name = _argv_value(argv, '--agent-name') or (_argv_value(argv, '--agent-id') or '?').split('@', 1)[0]
+        model = (_argv_value(argv, '--model') or '').removeprefix('claude-')
+        agents.setdefault(parent, []).append({
+            'pid':   int(entry.name),
+            'name':  name,
+            'type':  _argv_value(argv, '--agent-type'),
+            'model': model or None,
+        })
+    for lst in agents.values():
+        lst.sort(key=lambda a: a['name'])
+    return procs, agents
+
+
+def resolve_config_dir(env: dict[str, str]) -> str | None:
+    """CLAUDE_CONFIG_DIR d'un process, `~` résolu et validé absolu.
+
+    Un chemin relatif est rejeté (sans le cwd de la session, il pointerait sur
+    le cwd du watcher → registre/JSONL/watch au mauvais endroit) → None. None
+    aussi si la variable est absente.
+    """
+    config_dir = env.get('CLAUDE_CONFIG_DIR') or None
+    if config_dir:
+        config_dir = os.path.expanduser(config_dir)
+        if not os.path.isabs(config_dir):
+            return None
+    return config_dir
 
 
 def kill_session(pid: int, starttime: int, config_dir: str | None = None) -> bool:
@@ -915,10 +1010,14 @@ def get_session_registry(pid: int, starttime: int,
     return data
 
 
-def get_session_state(pid: int, cwd: str | None,
-                      starttime: int = 0,
-                      config_dir: str | None = None) -> tuple[str, int | None, str | None, str | None, float | None]:
-    """État de la session. Retourne (state, context_pct, tool_name, topic, last_activity).
+def get_session_state(
+    pid: int, cwd: str | None,
+    starttime: int = 0,
+    config_dir: str | None = None,
+) -> tuple[str, int | None, str | None, str | None, float | None, str | None]:
+    """État de la session. Retourne (state, context_pct, tool_name, topic,
+    last_activity, session_id) — session_id sert à rattacher les subagents
+    (--parent-session-id) à leur session ; None si le registre est absent.
 
     Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) est
     prioritaire quand il existe ; selon la version de Claude Code il peut être
@@ -960,7 +1059,7 @@ def get_session_state(pid: int, cwd: str | None,
                 pass
     else:
         state = jsonl_state or 'idle'
-    return state, context_pct, tool, topic, last_activity
+    return state, context_pct, tool, topic, last_activity, session_id
 
 
 def format_elapsed(s) -> str:
@@ -1086,11 +1185,40 @@ def scan_sessions() -> list[dict]:
     all_windows = get_all_windows()
     window_pids = {w['pid'] for w in all_windows}
 
-    procs = get_claude_processes()
+    procs, subagents = scan_proc(getattr(CFG, 'show_agents', True))
 
     sessions = []
     for p in procs:
         pid      = p['pid']
+        # Démon : pas une session focusable (ni terminal, ni JSONL, ni registre
+        # keyé par pid). On court-circuite tout le résolveur fenêtre/état et on
+        # émet une ligne minimale balisée `daemon` — ou rien si masqué en conf.
+        if p.get('is_daemon'):
+            if getattr(CFG, 'hide_daemons', False):
+                continue
+            cwd = get_cwd(pid)
+            sessions.append({
+                'pid':             pid,
+                'starttime':       p['starttime'],
+                'project':         project_label(cwd),
+                'worktree':        None,
+                'topic':           None,
+                'cwd':             cwd or '?',
+                'elapsed':         p['elapsed'],
+                'waiting':         False,
+                'working':         False,
+                'context_pct':     None,
+                'tool':            None,
+                'terminal_pid':    None,
+                'window_id':       None,
+                'kitty_socket':    None,
+                'kitty_window_id': None,
+                'config_dir':      resolve_config_dir(get_env(pid)),
+                'last_activity':   None,
+                'agents':          [],
+                'daemon':          True,
+            })
+            continue
         cwd      = get_cwd(pid)
         term     = get_parent_terminal(pid, window_pids)
         term_pid = term['pid'] if term else None
@@ -1112,16 +1240,8 @@ def scan_sessions() -> list[dict]:
         else:
             window_id = find_best_window(term_pid, cwd, all_windows)
 
-        config_dir = env.get('CLAUDE_CONFIG_DIR') or None
-        if config_dir:
-            # CLAUDE_CONFIG_DIR hérité de l'env de la session : on résout `~`
-            # (quoté → non-expansé par le shell) et on rejette tout chemin
-            # relatif (sans cwd de la session, il pointerait sur le cwd du
-            # watcher → registre/JSONL/watch au mauvais endroit). → défaut.
-            config_dir = os.path.expanduser(config_dir)
-            if not os.path.isabs(config_dir):
-                config_dir = None
-        state, context_pct, tool, topic, last_activity = get_session_state(
+        config_dir = resolve_config_dir(env)
+        state, context_pct, tool, topic, last_activity, session_id = get_session_state(
             pid, cwd, p['starttime'], config_dir)
         # Worktree « confirmé » = marqueur détecté ET transcript résolu
         # (last_activity = mtime du JSONL trouvé). On affiche alors le VRAI projet
@@ -1147,6 +1267,7 @@ def scan_sessions() -> list[dict]:
             'kitty_window_id': kitty_window_id,
             'config_dir':      config_dir,
             'last_activity':   last_activity,
+            'agents':          subagents.get(session_id, []) if session_id else [],
         })
     # Priorité d'état (attente > travaille > idle) dans tous les modes. En mode
     # 'idle', SEUL le groupe inactif est départagé par ancienneté d'inactivité
@@ -1171,6 +1292,24 @@ def scan_sessions() -> list[dict]:
 
 # ── Session row ───────────────────────────────────────────────────────────────
 
+def _session_tooltip(session: dict) -> str:
+    """Tooltip: full cwd + full topic (labels truncate both) + subagent list."""
+    tip = session['cwd']
+    if session.get('daemon'):
+        return f'{tip}\n\n{tr("tip_daemon")}'
+    topic = (session.get('topic') or '').strip()
+    if topic:
+        tip = f'{tip}\n\nTopic: {topic}'
+    agents = session.get('agents') or []
+    if agents:
+        lines = []
+        for a in agents:
+            detail = ', '.join(x for x in (a.get('type'), a.get('model')) if x)
+            lines.append(f' • {a["name"]}' + (f' ({detail})' if detail else ''))
+        tip = f'{tip}\n\n{tr("tip_agents")}\n' + '\n'.join(lines)
+    return tip
+
+
 class SessionRow(Gtk.EventBox):
     def __init__(self, session: dict):
         super().__init__()
@@ -1184,12 +1323,9 @@ class SessionRow(Gtk.EventBox):
         self.connect('destroy', self._on_destroyed)
 
         # Survol : chemin de travail complet + sujet complet (les labels tronquent
-        # — projet aux 2 derniers segments, sujet à la 1re ligne ellipsée).
-        tip = session['cwd']
-        topic = (session.get('topic') or '').strip()
-        if topic:
-            tip = f'{tip}\n\nTopic: {topic}'
-        self.set_tooltip_text(tip)
+        # — projet aux 2 derniers segments, sujet à la 1re ligne ellipsée)
+        # + détail des subagents.
+        self.set_tooltip_text(_session_tooltip(session))
         self.set_visible_window(True)
         self.connect('button-press-event', self._on_click)
         self.connect('enter-notify-event',  self._on_enter)
@@ -1257,12 +1393,18 @@ class SessionRow(Gtk.EventBox):
         right.set_valign(Gtk.Align.CENTER)
         self.badge = Gtk.Label()
         self.badge.set_halign(Gtk.Align.END)
+        # Subagent count, right under the state badge; hidden (no gap) when the
+        # session has no spawned subagents.
+        self.lbl_agents = Gtk.Label()
+        self.lbl_agents.set_halign(Gtk.Align.END)
+        self.lbl_agents.set_no_show_all(True)
         self.lbl_ctx = Gtk.Label()
         self.lbl_ctx.set_halign(Gtk.Align.END)
         self.lbl_ctx.set_ellipsize(Pango.EllipsizeMode.END)
         self.lbl_ctx.set_max_width_chars(16)
-        right.pack_start(self.badge,   False, False, 0)
-        right.pack_start(self.lbl_ctx, False, False, 0)
+        right.pack_start(self.badge,      False, False, 0)
+        right.pack_start(self.lbl_agents, False, False, 0)
+        right.pack_start(self.lbl_ctx,    False, False, 0)
         box.pack_end(right, False, False, 0)
 
         self._update_labels()
@@ -1277,26 +1419,28 @@ class SessionRow(Gtk.EventBox):
         _rebuild_sessions quand la structure (pids/colonnes) est inchangée.
         """
         self.session = session
-        tip = session['cwd']
-        topic = (session.get('topic') or '').strip()
-        if topic:
-            tip = f'{tip}\n\nTopic: {topic}'
-        self.set_tooltip_text(tip)
+        self.set_tooltip_text(_session_tooltip(session))
         self._update_labels()
         self.dot.queue_draw()
 
     def _update_labels(self):
         s = self.session
-        if s['waiting']:
+        daemon = s.get('daemon')
+        if daemon:
+            # Démon : ni actif ni inactif — point/badge neutres (gris), non pulsé.
+            color, badge_txt = TEXT_DIM2, tr('daemon')
+        elif s['waiting']:
             color, badge_txt = COLOR_WAITING, tr('attend')
         elif s['working']:
             color, badge_txt = COLOR_WORKING, tr('working')
         else:
             color, badge_txt = COLOR_IDLE, tr('idle')
         self._dot_color = color
+        # Préfixe « (D) » en orange Claude pour repérer le démon d'un coup d'œil.
+        prefix = f'<span foreground="{COLOR_CLAUDE}" weight="bold">(D)</span> ' if daemon else ''
         self.lbl_project.set_markup(
             f'<span foreground="{TEXT_PRIMARY}" font="Monospace 9" weight="500">'
-            f'{GLib.markup_escape_text(s["project"])}</span>'
+            f'{prefix}{GLib.markup_escape_text(s["project"])}</span>'
         )
         worktree = s.get('worktree')
         if worktree:
@@ -1358,6 +1502,15 @@ class SessionRow(Gtk.EventBox):
         self.badge.set_markup(
             f'<span foreground="{color}" font="Monospace 8">{badge_txt}</span>'
         )
+        n_agents = len(s.get('agents') or [])
+        if n_agents:
+            self.lbl_agents.set_markup(
+                f'<span foreground="{COLOR_CLAUDE}" font="Monospace 8">'
+                f'{n_agents} {tr("agents") if n_agents > 1 else tr("agent")}</span>'
+            )
+            self.lbl_agents.set_visible(True)
+        else:
+            self.lbl_agents.set_visible(False)
 
     def _draw_dot(self, widget, cr):
         c = Gdk.RGBA()
@@ -1387,7 +1540,10 @@ class SessionRow(Gtk.EventBox):
                             Gdk.NotifyType.NONLINEAR_VIRTUAL):
             return
         self._hovered = True
-        self.get_window().set_cursor(Gdk.Cursor.new_from_name(self.get_display(), 'pointer'))
+        # Curseur « main » pour signaler le clic-focus ; flèche par défaut pour le
+        # démon, qui n'est pas focusable.
+        cursor_name = 'default' if self.session.get('daemon') else 'pointer'
+        self.get_window().set_cursor(Gdk.Cursor.new_from_name(self.get_display(), cursor_name))
         self.queue_draw()
 
     def _on_leave(self, *_):
@@ -1400,6 +1556,10 @@ class SessionRow(Gtk.EventBox):
             self.queue_draw()
 
     def _do_focus(self):
+        # Le démon n'a pas de terminal : rien à focus. Garde unique couvrant les
+        # trois entrées (clic gauche, menu, Entrée clavier).
+        if self.session.get('daemon'):
+            return
         focus_terminal(
             self.session.get('window_id'),
             self.session['terminal_pid'],
@@ -1426,17 +1586,21 @@ class SessionRow(Gtk.EventBox):
         # Référence gardée sur self : sinon le menu est ramassé par le GC avant
         # même de s'afficher.
         self._ctx_menu = menu = Gtk.Menu()
-        item_focus = Gtk.MenuItem.new_with_label(tr('menu_focus'))
-        item_focus.connect('activate', lambda _m: self._do_focus())
-        menu.append(item_focus)
+        # Pas de « Focus » pour le démon : aucun terminal à activer.
+        if not s.get('daemon'):
+            item_focus = Gtk.MenuItem.new_with_label(tr('menu_focus'))
+            item_focus.connect('activate', lambda _m: self._do_focus())
+            menu.append(item_focus)
         item_pid = Gtk.MenuItem.new_with_label(f"{tr('menu_copy_pid')} ({s['pid']})")
         item_pid.connect(
             'activate',
             lambda _m: Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(str(s['pid']), -1))
         menu.append(item_pid)
         # « Fermer » réservé aux sessions inactives : on ne propose pas de tuer
-        # une session qui travaille ou attend une réponse (tour en cours).
-        if not s['waiting'] and not s['working']:
+        # une session qui travaille ou attend une réponse (tour en cours). Exclu
+        # aussi pour le démon — pas une session (pas de registre keyé par pid),
+        # le kill échouerait systématiquement avec un message trompeur.
+        if not s['waiting'] and not s['working'] and not s.get('daemon'):
             item_kill = Gtk.MenuItem.new_with_label(tr('menu_kill'))
             item_kill.connect('activate', lambda _m: self._confirm_kill())
             menu.append(item_kill)
@@ -1501,6 +1665,8 @@ class SettingsDialog(Gtk.Dialog):
             'sort_mode':  getattr(CFG, 'sort_mode', 'default'),
             'idle_format': getattr(CFG, 'idle_format', 'none'),
             'show_topic': getattr(CFG, 'show_topic', True),
+            'show_agents': getattr(CFG, 'show_agents', True),
+            'hide_daemons': getattr(CFG, 'hide_daemons', False),
             'refresh_ms': CFG.refresh_ms,
             'snooze_sec': CFG.snooze_sec,
             # Effective on-screen value, not CFG: shift+scroll moves it away
@@ -1639,6 +1805,16 @@ class SettingsDialog(Gtk.Dialog):
         self._chk_show_topic.set_active(getattr(CFG, 'show_topic', True))
         g2.attach(self._chk_show_topic, 0, 5, 3, 1)
 
+        # Toggles de fonctionnalité groupés avec show_topic, avant les champs
+        # numériques colonnes/hauteur/tri (rows 8+).
+        self._chk_show_agents = Gtk.CheckButton(label=tr('fld_show_agents'))
+        self._chk_show_agents.set_active(getattr(CFG, 'show_agents', True))
+        g2.attach(self._chk_show_agents, 0, 6, 3, 1)
+
+        self._chk_hide_daemons = Gtk.CheckButton(label=tr('fld_hide_daemons'))
+        self._chk_hide_daemons.set_active(getattr(CFG, 'hide_daemons', False))
+        g2.attach(self._chk_hide_daemons, 0, 7, 3, 1)
+
         self._lbl_width = field_label(tr('fld_width'))
         g2.attach(self._lbl_width, 0, 1, 1, 1)
         self._spin_width = Gtk.SpinButton.new_with_range(200, 800, 10)
@@ -1670,10 +1846,10 @@ class SettingsDialog(Gtk.Dialog):
             'clicked', lambda _b: self._spin_bg_alpha.set_value(BG_ALPHA_DEFAULT))
         g2.attach(btn_bg_default, 3, 4, 1, 1)
 
-        g2.attach(field_label(tr('fld_columns')), 0, 6, 1, 1)
+        g2.attach(field_label(tr('fld_columns')), 0, 8, 1, 1)
         self._spin_columns = Gtk.SpinButton.new_with_range(1, 6, 1)
         self._spin_columns.set_value(getattr(CFG, 'columns', 1))
-        g2.attach(self._spin_columns, 1, 6, 1, 1)
+        g2.attach(self._spin_columns, 1, 8, 1, 1)
 
         # Label « Hauteur max » + icône info (tooltip explicatif au survol) plutôt
         # qu'un « (0 = écran) » accolé : plus lisible, l'explication complète tient
@@ -1686,27 +1862,27 @@ class SettingsDialog(Gtk.Dialog):
         mh_info.set_tooltip_text(tr('help_max_height'))
         mh_lbl_box.pack_start(mh_lbl,  False, False, 0)
         mh_lbl_box.pack_start(mh_info, False, False, 0)
-        g2.attach(mh_lbl_box, 0, 7, 1, 1)
+        g2.attach(mh_lbl_box, 0, 9, 1, 1)
         # 0 = pas de limite propre (l'écran borne) ; pas-50 px ; plafond large.
         self._spin_max_height = Gtk.SpinButton.new_with_range(0, 4000, 50)
         self._spin_max_height.set_value(getattr(CFG, 'max_height', 0))
-        g2.attach(self._spin_max_height, 1, 7, 1, 1)
-        g2.attach(Gtk.Label(label="px"), 2, 7, 1, 1)
+        g2.attach(self._spin_max_height, 1, 9, 1, 1)
+        g2.attach(Gtk.Label(label="px"), 2, 9, 1, 1)
 
-        g2.attach(field_label(tr('fld_sort')), 0, 8, 1, 1)
+        g2.attach(field_label(tr('fld_sort')), 0, 10, 1, 1)
         self._combo_sort = Gtk.ComboBoxText()
         self._combo_sort.append('default', tr('sort_default'))
         self._combo_sort.append('idle',    tr('sort_idle'))
         self._combo_sort.set_active_id(getattr(CFG, 'sort_mode', 'default'))
-        g2.attach(self._combo_sort, 1, 8, 2, 1)
+        g2.attach(self._combo_sort, 1, 10, 2, 1)
 
-        g2.attach(field_label(tr('fld_idle_format')), 0, 9, 1, 1)
+        g2.attach(field_label(tr('fld_idle_format')), 0, 11, 1, 1)
         self._combo_idle = Gtk.ComboBoxText()
         self._combo_idle.append('none',    tr('idle_none'))
         self._combo_idle.append('loose',   tr('idle_loose'))
         self._combo_idle.append('precise', tr('idle_precise'))
         self._combo_idle.set_active_id(getattr(CFG, 'idle_format', 'none'))
-        g2.attach(self._combo_idle, 1, 9, 2, 1)
+        g2.attach(self._combo_idle, 1, 11, 2, 1)
 
         # ── Raccourci clavier ────────────────────────────────────────────────
         outer.pack_start(Gtk.Separator(), False, False, 0)
@@ -1739,6 +1915,8 @@ class SettingsDialog(Gtk.Dialog):
             (self._spin_width,    'value-changed'),
             (self._chk_auto_width,'toggled'),
             (self._chk_show_topic,'toggled'),
+            (self._chk_show_agents,  'toggled'),
+            (self._chk_hide_daemons, 'toggled'),
             (self._spin_bg_alpha, 'value-changed'),
             (self._spin_columns,    'value-changed'),
             (self._spin_max_height, 'value-changed'),
@@ -1781,6 +1959,8 @@ class SettingsDialog(Gtk.Dialog):
             'sort_mode':  self._combo_sort.get_active_id() or 'default',
             'idle_format': self._combo_idle.get_active_id() or 'none',
             'show_topic': self._chk_show_topic.get_active(),
+            'show_agents': self._chk_show_agents.get_active(),
+            'hide_daemons': self._chk_hide_daemons.get_active(),
             'refresh_ms': int(self._spin_refresh.get_value()),
             'snooze_sec': int(self._spin_snooze.get_value()),
             'bg_alpha':   int(self._spin_bg_alpha.get_value()),
@@ -2521,6 +2701,8 @@ class ClaudeWatcher(Gtk.Window):
         CFG.margin_x = values['margin_x']
         CFG.margin_y = values['margin_y']
         CFG.show_topic = values['show_topic']  # lu par get_session_info_from_jsonl au _refresh()
+        CFG.show_agents = values['show_agents']    # relu par scan_sessions au _refresh()
+        CFG.hide_daemons = values['hide_daemons']  # relu par scan_sessions au _refresh()
         if values['bg_alpha'] != round(self._effective_alpha() * 100):
             self._set_effective_alpha(values['bg_alpha'] / 100.0)
         # _compute_xy lit les attributs d'instance, pas CFG — garder en sync
@@ -2569,6 +2751,8 @@ class ClaudeWatcher(Gtk.Window):
         cfg_file['general']['hotkey']     = values['hotkey']
         cfg_file['features']['shortcut_enable'] = 'true' if values['shortcut_enable'] else 'false'
         cfg_file['features']['show_topic'] = 'true' if values['show_topic'] else 'false'
+        cfg_file['features']['show_agents'] = 'true' if values['show_agents'] else 'false'
+        cfg_file['features']['hide_daemons'] = 'true' if values['hide_daemons'] else 'false'
         cfg_file['display']['mode']       = 'free' if values['free'] else 'corner'
         cfg_file['display']['screen']     = str(values['screen'])
         cfg_file['display']['corner']     = values['corner']
@@ -3152,7 +3336,7 @@ def dump_round():
     intermédiaires (statut registre brut, état JSONL brut) à côté de l'état
     final réconcilié — exactement ce que calcule `get_session_state`.
     """
-    procs = get_claude_processes()
+    procs, subagents = scan_proc()
     if not procs:
         print('no claude session found')
         return
@@ -3160,18 +3344,21 @@ def dump_round():
         pid = p['pid']
         cwd = get_cwd(pid)
         env = get_env(pid)
-        config_dir = env.get('CLAUDE_CONFIG_DIR') or None
-        if config_dir:
-            config_dir = os.path.expanduser(config_dir)
-            if not os.path.isabs(config_dir):
-                config_dir = None
+        config_dir = resolve_config_dir(env)
+        if p.get('is_daemon'):
+            print(f"pid {pid}  {project_label(cwd)}  ({format_elapsed(p['elapsed'])})")
+            print(f"  cwd          {cwd or '?'}")
+            print(f"  config_dir   {display_config_dir(config_dir) or '(default)'}")
+            print("  => DAEMON    (marqué (D), pas une session)")
+            print()
+            continue
         reg = get_session_registry(pid, p['starttime'], config_dir)
         reg_status = reg.get('status') if reg else None
         session_id = reg.get('sessionId') if reg else None
         eff_cwd = cwd or (reg.get('cwd') if reg else None)
         jsonl_state, ctx, tool, topic, _ = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
         # Source de vérité : même appel que l'app, pour que `state` colle au badge.
-        state, _, _, _, last_activity = get_session_state(pid, cwd, p['starttime'], config_dir)
+        state, _, _, _, last_activity, _ = get_session_state(pid, cwd, p['starttime'], config_dir)
         # Worktree confirmé : même logique que scan_sessions (label = projet parent).
         wt_root, wt_name = split_worktree(eff_cwd)
         confirmed_wt = wt_name is not None and last_activity is not None
@@ -3187,6 +3374,9 @@ def dump_round():
         print(f"  context_pct  {ctx}")
         print(f"  tool         {tool}")
         print(f"  topic        {topic}")
+        ag = subagents.get(session_id, []) if session_id else []
+        ag_txt = f"{len(ag)}: " + ', '.join(a['name'] for a in ag) if ag else '(none)'
+        print(f"  agents       {ag_txt}")
         idle_for = f"{int(time.time() - last_activity)}s" if last_activity else '(unknown)'
         print(f"  idle_for     {idle_for}")
         print()
