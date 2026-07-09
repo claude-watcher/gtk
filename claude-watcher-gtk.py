@@ -1044,6 +1044,14 @@ def get_session_state(
     jsonl_state, context_pct, tool, topic, last_activity = get_session_info_from_jsonl(
         cwd, config_dir, session_id)
     if reg:
+        # /rename : un nom choisi par l'utilisateur (champ `name` sans
+        # nameSource='derived' — 'derived' = nom auto-généré, redondant avec le
+        # cwd) prime sur le titre IA du JSONL comme sujet affiché. Même
+        # interrupteur features.show_topic que le sujet classique.
+        reg_name = reg.get('name')
+        if reg_name and reg.get('nameSource') != 'derived' \
+                and getattr(CFG, 'show_topic', True):
+            topic = reg_name
         status = reg.get('status', '')
         state = _STATUS_MAP.get(status, 'idle')
         # 'shell' persiste tant qu'un shell de fond tourne (un `!cmd` interactif
@@ -3372,9 +3380,10 @@ def dump_round():
         reg_status = reg.get('status') if reg else None
         session_id = reg.get('sessionId') if reg else None
         eff_cwd = cwd or (reg.get('cwd') if reg else None)
-        jsonl_state, ctx, tool, topic, _ = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
-        # Source de vérité : même appel que l'app, pour que `state` colle au badge.
-        state, _, _, _, last_activity, _ = get_session_state(pid, cwd, p['starttime'], config_dir)
+        jsonl_state, ctx, tool, _, _ = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
+        # Source de vérité : même appel que l'app, pour que `state` et `topic`
+        # collent à l'affichage (topic = /rename éventuel, sinon titre IA).
+        state, _, _, topic, last_activity, _ = get_session_state(pid, cwd, p['starttime'], config_dir)
         # Worktree confirmé : même logique que scan_sessions (label = projet parent).
         wt_root, wt_name = split_worktree(eff_cwd)
         confirmed_wt = wt_name is not None and last_activity is not None
