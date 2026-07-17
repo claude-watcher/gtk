@@ -203,6 +203,7 @@ STRINGS = {
         'title':      'CLAUDE CODE',
         'waiting':    'attente',
         'working':    'travaille',
+        'background': 'en fond',
         'idle':       'inactif',
         'no_session': 'aucune session active',
         'attend':     'attend',
@@ -304,6 +305,7 @@ STRINGS = {
         'title':      'CLAUDE CODE',
         'waiting':    'waiting',
         'working':    'working',
+        'background': 'background',
         'idle':       'idle',
         'no_session': 'no active session',
         'attend':     'waiting',
@@ -417,6 +419,7 @@ COLOR_TITLE   = "#cc8a2e"
 COLOR_WAITING = "#e86c3a"
 COLOR_WORKING = "#d4a052"
 COLOR_IDLE    = "#4caf7d"
+COLOR_BACKGROUND = "#5c8a9e"   # muted teal — un shell/tâche de fond tourne, Claude a rendu la main
 
 # Alpha values for the waiting-dot pulse (6 ticks @ 600 ms ≈ 3.6 s cycle)
 _PULSE_ALPHAS = [0.35, 0.6, 0.9, 1.0, 0.9, 0.6]
@@ -1057,19 +1060,24 @@ def get_session_state(
         # Un statut de registre qui mappe sur 'working' peut rester FIGÉ alors que
         # la session a en réalité rendu la main :
         #   - 'shell' : un shell de fond (`!cmd` interactif ou Bash
-        #     run_in_background) persiste après la fin du tour ;
+        #     run_in_background, dont un Monitor) persiste après la fin du tour ;
         #   - 'busy'  : des sous-agents interrompus (crash / ESC) laissent le
         #     statut bloqué sur 'busy' sans jamais repasser 'idle'.
         # On recoupe avec le JSONL : s'il montre que le tour est terminé (dernier
         # assistant en stop_reason terminal, ou évènement système post-tour →
-        # 'waiting'/'idle'), l'état réel est celui du JSONL, pas 'working'. Une
-        # session vraiment active — y compris en attente de sous-agents, où le
-        # dernier message assistant porte les tool_use Task — donne
-        # jsonl_state='working' : la condition est fausse, aucune réconciliation.
-        # 'compacting' est volontairement EXCLU (vrai travail de fond, bref).
-        # jsonl_state vaut None si le JSONL est introuvable → condition fausse.
+        # 'waiting'/'idle'), on dégrade vers l'état 'background' : un travail de
+        # fond peut encore tourner, mais Claude ne calcule pas. On ne peut PAS
+        # distinguer un !cmd utilisateur d'un shell/Monitor Claude, ni un 'busy'
+        # résiduel — le registre est opaque là-dessus — d'où un état générique de
+        # basse priorité (waiting > working > background > idle), signalé sans
+        # voler la vedette à une session active/en attente. Une session vraiment
+        # active — y compris en attente de sous-agents, où le dernier message
+        # assistant porte les tool_use Task — donne jsonl_state='working' : la
+        # condition est fausse, aucune réconciliation. 'compacting' est
+        # volontairement EXCLU (vrai travail de fond, bref). jsonl_state vaut None
+        # si le JSONL est introuvable → condition fausse, on garde 'working'.
         if status in ('shell', 'busy') and jsonl_state in ('waiting', 'idle'):
-            state = jsonl_state
+            state = 'background'
         # Idle-since : instant EXACT du dernier changement d'état du registre
         # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
         # écritures de fond (résumés, todos) sans refléter l'inactivité réelle —
@@ -1231,6 +1239,7 @@ def scan_sessions() -> list[dict]:
                 'elapsed':         p['elapsed'],
                 'waiting':         False,
                 'working':         False,
+                'background':      False,
                 'context_pct':     None,
                 'tool':            None,
                 'terminal_pid':    None,
@@ -1283,6 +1292,7 @@ def scan_sessions() -> list[dict]:
             'elapsed':         p['elapsed'],
             'waiting':         state == 'waiting',
             'working':         state == 'working',
+            'background':      state == 'background',
             'context_pct':     context_pct,
             'tool':            tool,
             'terminal_pid':    term_pid,
@@ -1303,15 +1313,17 @@ def scan_sessions() -> list[dict]:
     if getattr(CFG, 'sort_mode', 'default') == 'idle':
         now = time.time()
         def _sort_key(s: dict) -> tuple:
-            if s['waiting']:   bucket = 0
-            elif s['working']: bucket = 1
-            else:              bucket = 2
+            if s['waiting']:      bucket = 0
+            elif s['working']:    bucket = 1
+            elif s['background']: bucket = 2
+            else:                 bucket = 3
             la = s.get('last_activity')
-            idle = ((now - la) if la is not None else float('inf')) if bucket == 2 else 0.0
+            idle = ((now - la) if la is not None else float('inf')) if bucket == 3 else 0.0
             return (bucket, idle, s['project'].lower())
         sessions.sort(key=_sort_key)
     else:
-        sessions.sort(key=lambda s: (not s['waiting'], not s['working'], s['project'].lower()))
+        sessions.sort(key=lambda s: (
+            not s['waiting'], not s['working'], not s['background'], s['project'].lower()))
     return sessions
 
 # ── Session row ───────────────────────────────────────────────────────────────
@@ -1457,6 +1469,8 @@ class SessionRow(Gtk.EventBox):
             color, badge_txt = COLOR_WAITING, tr('attend')
         elif s['working']:
             color, badge_txt = COLOR_WORKING, tr('working')
+        elif s['background']:
+            color, badge_txt = COLOR_BACKGROUND, tr('background')
         else:
             color, badge_txt = COLOR_IDLE, tr('idle')
         self._dot_color = color
@@ -1514,9 +1528,11 @@ class SessionRow(Gtk.EventBox):
                 f'<span foreground="{TEXT_DIM2}" font="Monospace 8">'
                 f'{GLib.markup_escape_text(tool)}</span>'
             )
-        elif not s['working'] and not s['waiting'] and idle_fmt != 'none' and la is not None:
+        elif not s['working'] and not s['waiting'] and not s['background'] \
+                and idle_fmt != 'none' and la is not None:
             # Session inactive : la colonne outil (vide en idle) sert la durée
-            # d'inactivité = now − dernière activité (mtime du JSONL).
+            # d'inactivité = now − dernière activité (mtime du JSONL). Exclut
+            # 'background' : un fond tourne, la session n'est pas vraiment inactive.
             self.lbl_ctx.set_markup(
                 f'<span foreground="{TEXT_DIM2}" font="Monospace 8">'
                 f'{GLib.markup_escape_text(format_idle(time.time() - la, idle_fmt))}</span>'
@@ -2862,15 +2878,17 @@ class ClaudeWatcher(Gtk.Window):
         self._mi_about.set_label(tr('about'))
         self._mi_quit.set_label(tr('quit'))
 
-    def _update_tray(self, waiting: int, working: int, total: int):
+    def _update_tray(self, waiting: int, working: int, background: int, total: int):
         if not self._tray:
             return
-        if waiting:   color = COLOR_WAITING
-        elif working: color = COLOR_WORKING
-        elif total:   color = COLOR_IDLE
-        else:         color = TEXT_DIM
+        if waiting:      color = COLOR_WAITING
+        elif working:    color = COLOR_WORKING
+        elif background: color = COLOR_BACKGROUND
+        elif total:      color = COLOR_IDLE
+        else:            color = TEXT_DIM
         tooltip = (
-            f"{waiting} {tr('waiting')} · {working} {tr('working')} · {total} total"
+            f"{waiting} {tr('waiting')} · {working} {tr('working')} · "
+            f"{background} {tr('background')} · {total} total"
             if total else tr('no_session')
         )
         if HAS_APPINDICATOR:
@@ -3270,17 +3288,21 @@ class ClaudeWatcher(Gtk.Window):
         return True
 
     def _rebuild_sessions(self):
-        waiting = sum(1 for s in self.sessions if s['waiting'])
-        working = sum(1 for s in self.sessions if s['working'])
-        total   = len(self.sessions)
+        waiting    = sum(1 for s in self.sessions if s['waiting'])
+        working    = sum(1 for s in self.sessions if s['working'])
+        background = sum(1 for s in self.sessions if s['background'])
+        total      = len(self.sessions)
 
-        self._update_tray(waiting, working, total)
+        self._update_tray(waiting, working, background, total)
 
         parts = []
         if waiting:
             parts.append(f'<span foreground="{COLOR_WAITING}">{waiting} {tr("waiting")}</span>')
         if working:
             parts.append(f'<span foreground="{COLOR_WORKING}">{working} {tr("working")}</span>')
+        if background:
+            parts.append(
+                f'<span foreground="{COLOR_BACKGROUND}">{background} {tr("background")}</span>')
         if not self.sessions:
             parts.append(f'<span foreground="{TEXT_DIM}">{tr("no_session")}</span>')
         else:
