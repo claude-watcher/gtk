@@ -1054,15 +1054,21 @@ def get_session_state(
             topic = reg_name
         status = reg.get('status', '')
         state = _STATUS_MAP.get(status, 'idle')
-        # 'shell' persiste tant qu'un shell de fond tourne (un `!cmd` interactif
-        # ou un Bash run_in_background), MÊME après que Claude a rendu la main :
-        # le statut reste figé sur 'shell' alors que la session attend en réalité
-        # l'utilisateur. On recoupe avec le JSONL — s'il indique que le tour est
-        # terminé (dernier assistant en stop_reason terminal → 'waiting'/'idle'),
-        # le shell n'est qu'un résidu de fond et l'état réel est celui du JSONL,
-        # pas 'working'. jsonl_state vaut None si le JSONL est introuvable : la
-        # condition est alors fausse et on garde l'ancien comportement.
-        if status == 'shell' and jsonl_state in ('waiting', 'idle'):
+        # Un statut de registre qui mappe sur 'working' peut rester FIGÉ alors que
+        # la session a en réalité rendu la main :
+        #   - 'shell' : un shell de fond (`!cmd` interactif ou Bash
+        #     run_in_background) persiste après la fin du tour ;
+        #   - 'busy'  : des sous-agents interrompus (crash / ESC) laissent le
+        #     statut bloqué sur 'busy' sans jamais repasser 'idle'.
+        # On recoupe avec le JSONL : s'il montre que le tour est terminé (dernier
+        # assistant en stop_reason terminal, ou évènement système post-tour →
+        # 'waiting'/'idle'), l'état réel est celui du JSONL, pas 'working'. Une
+        # session vraiment active — y compris en attente de sous-agents, où le
+        # dernier message assistant porte les tool_use Task — donne
+        # jsonl_state='working' : la condition est fausse, aucune réconciliation.
+        # 'compacting' est volontairement EXCLU (vrai travail de fond, bref).
+        # jsonl_state vaut None si le JSONL est introuvable → condition fausse.
+        if status in ('shell', 'busy') and jsonl_state in ('waiting', 'idle'):
             state = jsonl_state
         # Idle-since : instant EXACT du dernier changement d'état du registre
         # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
