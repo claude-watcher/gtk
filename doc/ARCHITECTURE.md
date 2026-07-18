@@ -65,8 +65,11 @@ the raw label untouched.
    - a `shell` or `busy` status can stick after the turn actually ended (a
      background shell outliving the turn, or interrupted subagents that never
      flip the status back). When the transcript shows the turn finished
-     (`waiting`/`idle`), that status is reconciled down to the transcript state.
-     `compacting` is not reconciled — it is genuine, brief background work.
+     (`waiting`/`idle`), that status is reconciled down to **background** — a
+     low-priority state (`waiting` > `working` > `background` > `idle`) meaning
+     work may still run in the background while Claude itself is no longer
+     computing. `compacting` is not reconciled — it is genuine, brief
+     background work.
    Not every Claude Code version writes this file; when it is absent the widget
    uses the transcript fallback below.
 3. **State (transcript fallback)** — used when no registry file is present.
