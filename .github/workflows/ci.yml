@@ -1,0 +1,33 @@
+name: ci
+
+# Tests on every PR and push to main.
+# `--no-project` on purpose: the project's own deps pull PyGObject, which builds
+# from source and needs apt libs. The tests stub gi/cairo (see tests/conftest.py)
+# so CI stays a plain interpreter + pytest.
+
+on:
+  push:
+    branches: [main, master, develop, trunk]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Pytest
+        run: uv run --no-project --with pytest pytest tests/ -q
