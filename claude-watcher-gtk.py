@@ -768,20 +768,48 @@ def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path |
     return path if path.exists() else None
 
 
-DEFAULT_CONTEXT_WINDOW = 200_000
+DEFAULT_CONTEXT_WINDOW = 1_000_000
+
+# Modèles qui démarrent à 200k — deux cas, même hypothèse de départ :
+#   - 200k ferme : le modèle n'a pas de fenêtre 1M ;
+#   - sous condition : Opus 4.6 / Sonnet 4.6 n'atteignent le 1M que via le
+#     « extended context » de Claude Code, qui dépend du plan (Opus : inclus en
+#     Max/Team/Enterprise, crédits en Pro ; Sonnet 4.6 : crédits sur tous les
+#     plans) et se désactive avec CLAUDE_CODE_DISABLE_1M_CONTEXT=1.
+# Comparés en sous-chaîne de `message.model`, qui peut être daté
+# (`claude-opus-4-5-20251101`), préfixé plateforme (`anthropic.claude-opus-4-5…`)
+# ou un alias nu (`opus`, `haiku`).
+CONTEXT_200K = (
+    'haiku',  # toutes les générations Haiku, y compris haiku-4-5
+    'opus-4-5',
+    'opus-4-1',
+    'opus-4-2025',  # claude-opus-4-20250514
+    'sonnet-4-5',
+    'sonnet-4-2025',  # claude-sonnet-4-20250514
+    'claude-3',
+    'claude-2',
+    'opus-4-6',  # sous condition
+    'sonnet-4-6',  # sous condition
+)
 
 
-def context_window_for(model: str | None) -> int:
-    """Fenêtre de contexte (tokens) déduite du nom du modèle.
+def context_window_for(model: str | None, observed_tokens: int = 0) -> int:
+    """Fenêtre de contexte (tokens) déduite du modèle et de l'usage observé.
 
-    Le JSONL ne trace ni la taille de fenêtre ni le beta 1M d'Opus : on déduit
-    donc depuis `message.model` (heuristique). Claude Code lance Opus/Sonnet 4.x
-    et Fable/Mythos 5 avec la fenêtre 1M ; Haiku et les modèles inconnus
-    retombent sur 200k.
+    Le JSONL ne trace pas la taille de fenêtre, et rien ne distingue un modèle
+    « sous condition » resté à 200k du même modèle passé à 1M : le sélecteur
+    `[1m]` de Claude Code n'arrive jamais dans `message.model` (une session
+    `claude-opus-5[1m]` journalise `claude-opus-5`). D'où : 1M par défaut (tout
+    modèle hors CONTEXT_200K est en 1M sur tous les plans), 200k pour
+    CONTEXT_200K, puis promotion à 1M dès qu'un message dépasse les 200k — ce
+    que seule une vraie fenêtre 1M permet.
+
+    Partir sur 200k garde l'erreur du bon côté : un ctx% surévalué alerte tôt,
+    un ctx% sous-évalué masque une session au bord de la compaction.
     """
     m = (model or '').lower()
-    if 'opus-4' in m or 'sonnet-4' in m or 'fable-5' in m or 'mythos-5' in m:
-        return 1_000_000
+    if any(tag in m for tag in CONTEXT_200K):
+        return 1_000_000 if observed_tokens > 200_000 else 200_000
     return DEFAULT_CONTEXT_WINDOW
 
 
@@ -913,7 +941,7 @@ def _parse_session_lines(lines: list[str]) -> tuple[str | None, int | None, str 
                              + usage.get('cache_creation_input_tokens', 0)
                              + usage.get('cache_read_input_tokens', 0))
                     if total > 0:
-                        window = context_window_for(msg.get('model'))
+                        window = context_window_for(msg.get('model'), total)
                         context_pct = min(100, round(total * 100 / window))
         if state is not None and context_pct is not None:
             break
