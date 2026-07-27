@@ -30,6 +30,7 @@ Un widget de bureau GTK3 pour Ubuntu qui surveille toutes les sessions Claude Co
 - Icône systray avec indicateur d'état global
 - Pied de page affichant la version installée avec un indicateur de mise à jour (vert = à jour, rouge = une nouvelle version disponible)
 - Langue auto-détectée depuis la locale système (`fr` / `en`)
+- **Machines distantes** — les sessions d'autres hôtes servant `claude-watcher-webui`, fusionnées dans la même liste et balisées `<nom>:<projet>` (lecture seule ; voir [Sessions distantes](#sessions-distantes))
 
 > [!NOTE]
 > Le focus au clic est limité sous GNOME Wayland. Le reste du widget fonctionne
@@ -116,7 +117,139 @@ Réglages) — pas besoin de toucher à un fichier de config à la main.
 --no-tray           désactive l'icône systray
 --list-screens      affiche les monitors détectés et quitte
 --settings          ouvre la fenêtre de paramètres au lancement
+--remote NAME=URL   surveille une machine servant claude-watcher-webui (répétable)
+--no-local          n'affiche que les sessions distantes (aucun scan /proc local)
 ```
+
+## Sessions distantes
+
+Pointez le widget vers d'autres machines qui font tourner
+[`claude-watcher-webui`](https://github.com/claude-watcher/webui) : leurs sessions
+apparaissent dans la même liste, balisées `<nom>:<projet>` (convention scp). Les lignes
+distantes sont en **lecture seule** : ni focus, ni fermeture — le menu clic droit ne les
+propose pas. Un remote qui ne répond plus est marqué périmé avec l'âge de ses données, et
+chaque remote configuré figure dans la zone d'état du pied de fenêtre avec sa santé —
+`lab ok 3` (joignable) n'est jamais confondu avec `lab injoignable`. La fenêtre de
+réglages les liste en lecture seule dans l'onglet **Distants**, les désactivés grisés.
+
+### D'abord, sur la machine distante
+
+Il y a une moitié serveur, et elle n'est pas optionnelle :
+
+1. Installez et **lancez**
+   [`claude-watcher-webui`](https://github.com/claude-watcher/webui) sur cette machine —
+   le widget n'est qu'un consommateur de son `GET /api/sessions`.
+2. webui écoute par défaut sur `APP_HOST=127.0.0.1` : tel quel, il n'est joignable **que
+   depuis la machine elle-même**. Pour le regarder d'ailleurs, il faut soit élargir
+   l'écoute, soit tunneliser (voir plus bas).
+3. Une écoute non-loopback (`0.0.0.0` par exemple) **sans** `APP_AUTH_TOKEN` est
+   **refusée au démarrage** — posez un token, ou acceptez explicitement le risque avec
+   `APP_ALLOW_INSECURE_BIND=true`. Ce token est celui que vous donnerez au widget.
+
+> **webui parle HTTP en clair.** Il ne termine aucun TLS (il n'existe pas de réglage
+> `ssl_certfile`), donc `https://box:8000/` ne marche **pas** contre lui : la connexion
+> échoue sur `SSL: RECORD_LAYER_FAILURE`. Utilisez `http://`, ou placez un reverse proxy
+> (nginx, Caddy, Traefik) devant et pointez le widget vers l'URL `https://` du proxy.
+
+La forme la plus sûre ne demande aucun proxy et garde le token hors du réseau — un tunnel
+SSH vers une URL loopback :
+
+```bash
+ssh -N -L 8001:127.0.0.1:8000 box &          # webui reste sur 127.0.0.1 côté « box »
+/usr/bin/python3 ~/.local/share/claude-watcher/claude-watcher --remote lab=http://127.0.0.1:8001
+```
+
+### Déclarer des remotes
+
+Les remotes permanents se déclarent dans `~/.config/claude-watcher/config.ini` (partagé
+avec la TUI : une seule déclaration pour les deux) :
+
+```ini
+[remotes]
+poll_ms = 2000              # intervalle d'interrogation, distinct de refresh_ms.
+                            # Défaut 2000, plancher 250 — en dessous vous
+                            # martelez l'hôte plus que vous ne le surveillez.
+
+[remote:lab]
+url = http://box:8000/      # SEULE clé obligatoire ; une section sans elle est ignorée
+token = s3cr3t
+enabled = true              # 1/yes/true/on · 0/no/false/off. Toute autre valeur
+                            # est refusée au démarrage plutôt que prise pour « on »
+label = lab                 # optionnel, défaut : le nom de la section
+```
+
+Le fichier est forcé en mode `0600` à chaque écriture du widget, puisqu'il peut contenir
+des tokens. Si vous le créez ou l'éditez à la main, faites
+`chmod 600 ~/.config/claude-watcher/config.ini` vous-même — rien ne re-chmode un fichier
+que le widget n'a jamais écrit.
+
+Pour jeter un œil ponctuel à une machine, utilisez le drapeau — il n'est jamais écrit dans
+le fichier de config :
+
+```bash
+/usr/bin/python3 ~/.local/share/claude-watcher/claude-watcher --remote lab=http://box:8000
+/usr/bin/python3 ~/.local/share/claude-watcher/claude-watcher --remote lab=http://remote:s3cr3t@box:8000/
+CW_REMOTE_TOKEN_LAB=s3cr3t /usr/bin/python3 ~/.local/share/claude-watcher/claude-watcher --remote lab=http://box:8000
+```
+
+Ordre de résolution du token, premier trouvé gagne :
+
+1. le userinfo de l'URL — `https://remote:<token>@hote/` (le token est le **mot de
+   passe** ; `https://<token>@hote/` sans deux-points marche aussi)
+2. `CW_REMOTE_TOKEN_<NOM>` — le nom en majuscules, non-alphanumériques remplacés par `_`
+   (`--remote my-lab=…` → `CW_REMOTE_TOKEN_MY_LAB`)
+3. la clé `token` de la section `[remote:<nom>]` correspondante
+4. aucun — le remote est interrogé sans authentification
+
+Quelle que soit sa provenance, le token part dans un **en-tête** `X-API-Key`, jamais dans
+un paramètre de query — webui n'accepte le token qu'en en-tête (`X-API-Key`,
+`Authorization: Bearer`, `Authorization: Basic`), et il journalise `query_params` à chaque
+requête : un token dans l'URL serait à la fois refusé et écrit en clair dans le log du
+serveur. Une query présente dans l'URL du remote est tout de même transmise telle quelle —
+le widget ne réécrit pas votre URL, et un reverse proxy peut avoir besoin de ses propres
+paramètres — mais elle ne vous authentifiera pas, et elle est masquée partout où le widget
+l'affiche.
+
+> **Le token doit être en ASCII.** Les valeurs d'en-tête HTTP sont en latin-1 : un token
+> hors de cette plage s'authentifierait comme une autre chaîne ; webui refuse un tel token
+> au démarrage plutôt que de servir des 401 inexplicables.
+
+> **Un token passé dans `--remote` est visible par tous les utilisateurs de la machine**
+> via `/proc/<pid>/cmdline`, lisible par tous (`-r--r--r--`), alors que
+> `/proc/<pid>/environ` n'est lisible que par son propriétaire (`-r--------`). Sur une
+> machine partagée, préférez `CW_REMOTE_TOKEN_<NOM>` ou le fichier de config (`0600`).
+
+> **Un token envoyé à un remote `http://` circule en clair**, et le widget ne vous en
+> empêchera pas. Utilisez un tunnel SSH vers une URL loopback, ou un reverse proxy qui
+> termine le `https://` (les certificats sont alors vérifiés, sans option pour le
+> désactiver).
+
+Seules les URL `http` et `https` sont interrogées : un `--remote lab=box` sans schéma ou
+une coquille `file://` sont signalés comme une erreur sur ce remote, pas exécutés.
+
+### Modes de panne, et ce que le widget en fait
+
+| Situation | Comportement |
+|---|---|
+| Hôte lent ou figé | timeout de 5 s (connexion et lecture) **et** budget total de lecture de 5 s ; un thread par remote, donc seul cet hôte est ralenti |
+| Réponse énorme | lecture plafonnée à 4 Mio, poll compté en échec |
+| Échecs répétés | backoff exponentiel, plafonné à 60 s |
+| HTTP 401 / 403 | affiché comme une erreur d'auth, réessayé au plus toutes les 5 min |
+| Redirections | **non suivies** — une 302 rejouerait votre token vers la cible |
+| Plus de 500 sessions | tronqué, et la zone d'état affiche `lab ok 500/612` |
+| Premier poll en cours | `lab démarrage`, pas `lab injoignable` |
+| Thread de poll disparu | `lab thread arrêté` — jamais un `ok` trompeur |
+
+Les remotes sont lus au démarrage : en ajouter ou en retirer demande un redémarrage.
+Pointer un remote vers votre propre machine avec le scan local actif liste chaque session
+deux fois — une fois nue, une fois préfixée ; c'est un choix de configuration, pas un bug.
+
+`--dump` est un diagnostic **local** (il affiche les valeurs brutes registre/JSONL derrière
+chaque état, qui n'existent que sur cette machine) : le combiner avec `--no-local`, ou avec
+une machine distante *activée* — déclarée par `--remote` comme par une section
+`[remote:<nom>]` du fichier de configuration — est refusé plutôt qu'ignoré en silence. Un
+remote laissé à `enabled = false` n'est jamais interrogé, il ne bloque donc pas le
+diagnostic.
 
 ## Comment ça marche
 
