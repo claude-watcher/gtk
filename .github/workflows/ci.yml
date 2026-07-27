@@ -1,9 +1,11 @@
 name: ci
 
-# Tests on every PR and push to main.
+# Tests, lint and shared-core parity on every PR and push to main.
 # `--no-project` on purpose: the project's own deps pull PyGObject, which builds
 # from source and needs apt libs. The tests stub gi/cairo (see tests/conftest.py)
 # so CI stays a plain interpreter + pytest.
+# pytest-timeout is pulled in because pyproject.toml sets `timeout = 60`: without
+# the plugin the key is silently ignored and a hung stop() burns the whole job.
 
 on:
   push:
@@ -24,10 +26,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The remote-sessions core is carried verbatim by the TUI, and
+      # tests/test_core_parity.py checks it symbol by symbol. Without this
+      # checkout the test FAILS (CI is set) rather than skipping: a guard that
+      # never runs guards nothing.
+      #
+      # The SAME checkout exists mirrored in the TUI repo, and it has to: while
+      # the guard lived here only, a core change landing as a TUI-only PR went
+      # green over there and later reddened an unrelated GTK PR — blaming the
+      # wrong author.
+      #
+      # Branch-to-branch when the same branch exists on both sides (a shared-core
+      # change lands as one branch name in two repos), default branch otherwise.
+      # Corollary, and it is an ORDERING CONSTRAINT, not a bug: a core change is
+      # only green here once its twin is pushed to the TUI repo.
+      - name: Checkout the TUI (shared remote core, matching branch)
+        id: tui_branch
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/tui
+          ref: ${{ github.head_ref || github.ref_name }}
+          path: _tui
+
+      - name: Checkout the TUI (default branch fallback)
+        if: steps.tui_branch.outcome == 'failure'
+        uses: actions/checkout@v4
+        with:
+          repository: claude-watcher/tui
+          path: _tui
+
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
 
       - name: Pytest
-        run: uv run --no-project --with pytest pytest tests/ -q
+        run: uv run --no-project --with pytest --with pytest-timeout pytest tests/ -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      # THE SAME command as the local hook, not a replay of two of its steps:
+      # replaying only ruff and mypy let the other six hooks through (end of file,
+      # trailing whitespace, YAML/TOML, private key, shebangs) for a contributor
+      # without pre-commit installed. The TUI diagnosed exactly this and fixed it
+      # there; this job shipped the version it had diagnosed as bad.
+      - name: Pre-commit
+        run: uvx pre-commit@4.4.0 run --all-files --show-diff-on-failure

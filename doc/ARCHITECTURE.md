@@ -28,9 +28,72 @@ shortcut_enable = true   # global show/hide hotkey (true | false)
 show_topic      = true   # per-row session topic subtitle (true | false)
 show_agents     = true   # per-row spawned-subagent count + tooltip list (true | false)
 hide_daemons    = false  # hide the Claude Code background daemon rows (true | false)
+
+[remotes]
+poll_ms = 2000        # remote poll interval, separate from refresh_ms (a network round trip)
+
+[remote:lab]          # one section per remote machine; the name is the on-screen label
+url     = http://box:8000/   # the ONLY required key (webui speaks plain HTTP; see README)
+token   = s3cr3t      # optional; see the README for the resolution order
+enabled = true        # optional, default true; 1/yes/true/on · 0/no/false/off,
+                      # anything else is refused at startup
+label   = lab         # optional, defaults to the section name
 ```
 
-CLI flags (see the README) override these at launch. The free-drag position is
+`poll_ms` defaults to 2000 and is floored at 250.
+
+No `[remote:*]` section and no `--remote` flag means no poll thread is started and no HTTP
+request is ever made — behaviour is exactly what it was before the feature existed.
+`save_config()` forces the file to mode `0600` on every write, unconditionally, because it
+may hold tokens (it opens with `os.open(..., 0o600)` and chmods an existing file *before*
+writing: `Path.touch(mode=…)` does not re-chmod one that already exists, which is exactly
+the upgrade path). Each remote gets one daemon thread that polls sequentially and hands its
+result back to the GTK loop through `GLib.idle_add` — no widget is ever touched off the
+main thread, and `_refresh()` reads a cache instead of doing HTTP.
+
+Nothing that runs in the GTK loop may raise: `GLib.timeout_add` **removes a source whose
+callback raised**, so a single bad row would freeze the whole widget — local sessions
+included — with the traceback on a stderr a desktop-launched widget does not have. Hence
+the guarded body in `_refresh()`, and the guarded body in `RemotePoller._loop()` on the
+other side, where an escaping exception would instead kill a poll thread for good (the
+remote would then read `ok`, then `stale` forever). A poller whose thread is gone reports
+`dead`, never a stale-looking `ok`.
+
+Remote rows are read-only at the choke point: `kill_session()` and `focus_terminal()` both
+take the session dict and return `False` on `remote` as their first statement, because a
+remote pid `1234` is an unrelated *local* process `1234`. The UI never offers the
+affordance either (no Focus, no Close in the context menu) and the row tooltip says why —
+the same convention as daemon rows. For the same reason a remote row's `config_dir` never
+becomes a local directory monitor (`local_config_dirs()`): a remote's `~/.claude` also
+exists on this machine, so the naive loop would register a local monitor on a remote's
+behalf.
+
+Two clocks, deliberately: a remote's **staleness** is stamped with `time.monotonic()` (a
+backward NTP step or a resumed laptop must not make a day-dead host look fresh), while a
+session's `last_activity` stays on the **wall clock**, because the renderer compares it to
+`time.time()` exactly as it does for a local row. The state key is named `received_mono` so
+the two cannot be confused.
+
+The whole remote block is **shared verbatim with the TUI** — same constants, same adapter,
+same poller. `tests/test_core_parity.py` compares the two files symbol by symbol on the AST
+(docstrings, comments and the client-naming tokens excluded) so the next drift is caught
+mechanically rather than by a comment nobody reads. **The same guard is mirrored in the TUI
+repo** (`CW_GTK_SCRIPT`, sibling checkout in its own CI): while it lived here only, a core
+change landing as a TUI-only PR went green over there and later reddened an unrelated GTK
+PR, blaming the wrong author. Both CIs check the sibling out branch-to-branch, which makes
+it an ordering constraint — a core change is green only once its twin is pushed. The one declared divergence is the row
+prefix: the TUI truncates a *path* from the left and must reserve the `<label>:` budget
+(`session_path_cell`), while GTK prefixes the *project* in a Pango label ellipsized at END
+(`session_project_markup`), where the marker survives truncation by construction.
+
+CLI flags (`--remote NAME=URL`, `--no-local`, see the README) override these at launch.
+`--dump` is local-only. The refusal lives in `main()`, **after** `resolve_remotes()`, not in
+`parse_args()`: that is the only point where both sources of remotes are visible. Placed in
+`parse_args()` it only ever saw `--remote`, so a `[remote:*]` section of the config file
+sailed through and `dump_round()` ignored it without a word — the very silence the refusal
+exists to prevent.
+`--remote` merges over a matching section (its URL wins for the run, the section's other
+keys survive) and is never persisted. The free-drag position is
 stored separately in `~/.config/claude-watcher/position.json`; if it falls
 outside any connected screen (e.g. a monitor was unplugged), the widget resets to
 the default corner.

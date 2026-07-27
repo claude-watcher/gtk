@@ -1,0 +1,42 @@
+# Garde-fou de style et de typage. Le dépôt n'en déclarait AUCUN : chaque
+# remarque de typage était invisible pour la CI.
+#
+# Ce qu'il fait : ruff check (E,W,F,I,B,C4,UP à 110 colonnes) et mypy
+# (check_untyped_defs, strict_optional) sur le script, plus l'hygiène de fichiers.
+# Ce qu'il NE fait PAS, sciemment : `ruff format`. Le formateur réécrirait les
+# 3500 lignes du script (alignements en colonnes, tables de correspondance), ce
+# qui produirait un diff illisible sans corriger un seul défaut. La configuration
+# vit dans pyproject.toml, qui explique chaque exception.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.0
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: detect-private-key
+      - id: check-executables-have-shebangs
+      - id: check-shebang-scripts-are-executable
+
+  # ATTENTION AUX VERSIONS (les TROIS dépôts bougent ENSEMBLE) : le socle de
+  # détection est aligné à la main avec webui/detect.py, donc un correctif propre
+  # sous une version peut faire rougir la PR jumelle d'un autre dépôt. ruff 0.16.x
+  # et mypy 2.1.x partout — ici par `rev:`, côté webui par son uv.lock (hooks
+  # locaux `uv run`). On les monte tous les trois, ou aucun.
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v2.1.0
+    hooks:
+      - id: mypy
+        # Le script n'a aucune dépendance d'exécution installable pour mypy
+        # (pygobject se construit depuis les sources et exige les en-têtes
+        # système) : ignore_missing_imports est posé dans pyproject.toml, et le
+        # fichier est passé explicitement.
+        args: [--config-file, pyproject.toml]
+        pass_filenames: false

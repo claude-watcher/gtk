@@ -16,3 +16,75 @@ package = false
 # still come from apt — see install.sh. System interpreter keeps the venv ABI
 # aligned with the distro GTK stack.
 python-preference = "only-system"
+# ATTENTION : `uv run pytest` NE MARCHE PAS ici — pygobject se construit depuis
+# les sources et exige les en-têtes système. Les tests n'en ont pas besoin
+# (gi/cairo sont stubés, cf. tests/conftest.py) : `python3 -m pytest`.
+
+# ── Garde-fous ────────────────────────────────────────────────────────────────
+# Le dépôt ne déclarait AUCUN gate : chaque remarque de typage ou de style était
+# invisible pour la CI. La configuration vit ici, partagée par le hook
+# pre-commit et le job de lint — un défaut ne peut pas passer l'un et échouer
+# l'autre.
+
+[tool.ruff]
+line-length = 110          # aligné sur webui et sur la TUI
+# Le plancher déclaré plus haut est TENU : le point le plus récent utilisé est
+# `zip(..., strict=True)` (3.10). Rien dans le fichier n'exige 3.11+ (aucun
+# except*, Self, StrEnum, TaskGroup ni datetime.UTC).
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+# Style MAISON, pas des défauts : le fichier aligne des `if x: y = 0` en colonnes
+# pour que les tables de correspondance se lisent d'un bloc. Reformater 3500
+# lignes pour satisfaire E701 coûterait un diff illisible et zéro bug corrigé.
+# (14 occurrences, toutes préexistantes.)
+ignore = ["E701"]
+
+[tool.ruff.lint.per-file-ignores]
+# Les imports gi/GTK NE PEUVENT PAS être en tête : `gi.require_version(...)` doit
+# tourner avant `from gi.repository import ...`, et les blocs try/except
+# d'imports optionnels (Wnck, AppIndicator3, GtkLayerShell, Keybinder) sont du
+# code, pas des imports. D'où E402 (21) et I001, qui juge le bloc dans son
+# ensemble. Les 5 lignes trop longues restantes portent chacune un `# noqa: E501`
+# nommé : la règle reste ACTIVE, c'est elle qui a attrapé la seule violation
+# introduite par la fonctionnalité « sessions distantes ».
+"claude-watcher-gtk.py" = ["E402", "I001"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["claude-watcher-gtk.py"]
+check_untyped_defs = true
+strict_optional = true
+warn_unused_configs = true
+ignore_missing_imports = true
+# NON activés, sciemment : le fichier compte 163 remarques préexistantes sous le
+# mode strict (méthodes de widgets GTK sans annotation, `list[dict]` non
+# paramétré, callbacks GTK dont la signature est imposée par le toolkit).
+# disallow_untyped_defs, disallow_any_generics et warn_return_any les feraient
+# toutes remonter d'un coup. Un garde-fou qu'on doit désactiver pour committer ne
+# garde rien ; celui-ci passe à zéro et attrape les vraies incohérences de type.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short --strict-markers"
+# Filet de sécurité GLOBAL, et PAS le garde-fou principal. Dire précisément ce
+# qu'il protège et ce qu'il ne protège pas, sinon on croit couvert ce qui ne
+# l'est pas :
+#
+#   * Cette clé n'est honorée QUE par pytest-timeout. Sans le greffon, pytest
+#     émet un avertissement et l'IGNORE en silence. Or la commande prescrite
+#     plus haut est `python3 -m pytest` (`uv run pytest` NE PEUT PAS marcher :
+#     pygobject se construit depuis les sources) — et c'est exactement là que le
+#     greffon manque. La TUI a réglé ça avec `required_plugins` ; ici, ce serait
+#     casser la seule commande viable.
+#   * Donc, sous `python3 -m pytest`, cette valeur ne protège RIEN. Mesuré : en
+#     retirant l'échéance de lecture de read_capped, `-k dribbling` pendait
+#     jusqu'au kill au lieu d'échouer.
+#   * Ce qui protège vraiment, ce sont les bornes que les deux tests capables de
+#     pendre portent EUX-MÊMES (tests/test_remote.py, `_bounded`) : lecture sans
+#     échéance et stop() cassé échouent ROUGE, greffon installé ou non.
+#   * Cette clé reste utile en CI, où le job installe pytest-timeout : elle y
+#     attrape un blocage IMPRÉVU, dans un test qui n'a pas de borne propre (la CI
+#     n'a pas de délai de job → 6 h de runner brûlées).
+timeout = 60

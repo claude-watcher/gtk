@@ -53,9 +53,15 @@ import signal
 import sys
 import threading
 import time
+import functools
+import traceback
+import urllib.error
+import urllib.parse
 import urllib.request
 import warnings
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='gi')
 
@@ -93,6 +99,30 @@ def _semver_tuple(s: str) -> tuple[int, ...]:
 # Glyphe titre terminal émis par Claude Code (séquence OSC)
 CLAUDE_IDLE_GLYPH = '✳'   # prompt visible, attend l'utilisateur
 
+# ── Constantes des sessions distantes ─────────────────────────────────────────
+# Déclarées ICI, avec les autres constantes de module : load_config() lit
+# REMOTE_POLL_MS et vivait 1400 lignes AVANT sa définition.
+
+REMOTE_POLL_MS       = 2000              # défaut de [remotes] poll_ms
+REMOTE_POLL_MIN_MS   = 250               # plancher : en-dessous on martèle l'hôte
+REMOTE_TIMEOUT_S     = 5                 # connexion ET lecture (urlopen)
+# Budget TOTAL de lecture, en horloge monotone. REMOTE_TIMEOUT_S est un timeout
+# PAR OPÉRATION socket : un pair qui livre un octet toutes les 4 s ne le déclenche
+# jamais et parquerait le thread indéfiniment, ce qui défait aussi stop().
+REMOTE_READ_BUDGET_S = 5
+REMOTE_READ_CHUNK    = 64 * 1024
+REMOTE_MAX_BYTES     = 4 * 1024 * 1024   # bombe mémoire sinon : read() non borné
+REMOTE_MAX_ROWS      = 500
+REMOTE_MAX_ELAPSED_S = 10 * 365 * 24 * 3600   # 10 ans : un elapsed importé non borné
+                                              # (2**63) rendrait « 2562047788015215h30m »
+REMOTE_STALE_X       = 3                 # périmé après 3 × l'intervalle de poll
+REMOTE_LABEL_MAX     = 12
+REMOTE_BACKOFF_MAX_S = 60
+# STRICTEMENT supérieur au plafond de backoff, sinon la constante ne peut jamais
+# changer le comportement : un token invalide ne se corrige pas en réessayant.
+REMOTE_AUTH_RETRY_S  = 300
+REMOTE_SCHEMES       = ('http', 'https')  # file:// serait lu par l'ouvreur par défaut
+
 def _parse_bg_alpha(raw) -> int:
     # Clamp to the 20-100 range advertised by the settings UI; a non-numeric
     # manual edit falls back to the default instead of crashing at startup
@@ -109,10 +139,25 @@ def load_config() -> dict:
     d = cfg['display']  if 'display'  in cfg else {}
     g = cfg['general']  if 'general'  in cfg else {}
     f = cfg['features'] if 'features' in cfg else {}
+    r = cfg['remotes']  if 'remotes'  in cfg else {}
 
     idle_fmt = d.get('idle_format', 'none').lower()
 
+    # Machines distantes : une section [remote:<nom>] par hôte (url, token,
+    # enabled, label). Aucune section → dict vide → aucun thread, aucun HTTP.
+    remote_sections = {
+        name.split(':', 1)[1]: dict(cfg[name])
+        for name in cfg.sections()
+        if name.startswith('remote:') and name.split(':', 1)[1]
+    }
+    try:
+        poll_ms = int(r.get('poll_ms', REMOTE_POLL_MS))
+    except (TypeError, ValueError):
+        poll_ms = REMOTE_POLL_MS
+
     return {
+        'remote_poll_ms': max(REMOTE_POLL_MIN_MS, poll_ms),
+        'remote_sections': remote_sections,
         'lang':       g.get('lang', _detect_lang()),
         'mode':       d.get('mode', 'corner'),
         'screen':     int(d.get('screen',     0)),
@@ -144,6 +189,62 @@ def load_config() -> dict:
     }
 
 
+def save_config(updates: dict[str, dict[str, str]]) -> None:
+    """Écrit les clés données dans config.ini, section par section.
+
+    Relit le fichier d'abord pour ne pas écraser les autres clés (config partagé
+    avec la TUI). configparser ne conserve pas les commentaires en réécriture —
+    comportement déjà admis ici.
+
+    Le fichier est forcé en 0600 INCONDITIONNELLEMENT : il peut contenir les
+    tokens des remotes ([remote:<nom>] token=). Sans branche « si un token est
+    présent » — une branche laisserait une fenêtre où le fichier est écrit
+    lisible par tous juste avant que le token n'y atterrisse.
+
+    Le chmod a lieu AVANT l'écriture, et la création passe par os.open(0600) :
+    touch(mode=0600, exist_ok=True) NE re-chmode PAS un fichier existant, donc
+    sur le chemin de mise à niveau (un config.ini 0644 écrit par une version
+    d'avant les remotes — le cas courant) le token était écrit lisible par tous,
+    et le chmod d'après-coup ne refermait la fenêtre qu'une fois le secret sur
+    le disque.
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read(CONFIG_PATH)
+    for section, values in updates.items():
+        if section not in cfg:
+            cfg[section] = {}
+        for k, v in values.items():
+            cfg[section][k] = v
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if CONFIG_PATH.exists():
+            CONFIG_PATH.chmod(0o600)
+        fd = os.open(CONFIG_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w') as fh:
+            cfg.write(fh)
+    except OSError:
+        pass
+
+
+def parse_remote_flag(spec: str) -> tuple[str, str]:
+    """`--remote NAME=URL` → (nom, url). Lève pour argparse si la forme est fausse."""
+    name, sep, url = spec.partition('=')
+    if not sep or not name.strip() or not url.strip():
+        raise argparse.ArgumentTypeError(
+            f"format attendu NAME=URL (reçu : {spec!r})")
+    # « NAME=URL#TOKEN » vient d'un brouillon abandonné de la spec : le fragment
+    # serait mangé par l'URL (/api/sessions jamais demandé), aucun en-tête d'auth
+    # ne partirait, et le secret atterrirait NON RÉDIGÉ dans display_url. On le
+    # refuse en nommant les formes réellement supportées plutôt que de l'accepter
+    # silencieusement de travers.
+    if '#' in url:
+        raise argparse.ArgumentTypeError(
+            f"'#' non supporté dans --remote (reçu : {spec!r}). Pour un token, utilisez "
+            f"NAME=https://remote:TOKEN@hote/, la variable {remote_token_env('NAME')} "
+            f"ou la clé token de la section [remote:NAME].")
+    return name.strip(), url.strip()
+
+
 def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Claude Code Watcher — widget GTK3 de suivi des sessions Claude.",
@@ -169,9 +270,28 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
                    help="un tour de calcul d'état (registre vs JSONL vs final) en texte, puis quitte.")
     p.add_argument('--settings', action='store_true',
                    help="ouvre directement la fenêtre de paramètres au lancement.")
+    # metavar neutre : « NOM=URL » s'affichait même sous --lang en (l'aide
+    # argparse n'est pas traduite, autant ne pas panacher les langues).
+    p.add_argument('--remote', dest='remote', action='append', metavar='NAME=URL',
+                   type=parse_remote_flag, default=[],
+                   help="ajoute une machine distante servant claude-watcher-webui "
+                        "(répétable ; webui parle HTTP en clair, cf. README). L'URL "
+                        "peut porter le token : "
+                        "http://remote:TOKEN@hote:8000/ — ATTENTION, un token en "
+                        "ligne de commande est lisible par TOUS les utilisateurs de la "
+                        "machine via /proc/<pid>/cmdline ; préférez "
+                        "CW_REMOTE_TOKEN_<NOM> ou la section [remote:<nom>] du "
+                        "config.ini (forcé en 0600). Jamais persisté.")
+    p.add_argument('--no-local', dest='no_local', action='store_true',
+                   help="n'analyse pas /proc : n'affiche que les sessions distantes.")
     args = p.parse_args(argv)
     if (args.x is None) != (args.y is None):
         p.error('--x et --y doivent être fournis ensemble.')
+    # L'incompatibilité de --dump avec les sessions distantes est vérifiée dans
+    # main(), PAS ici : un remote peut aussi venir d'une section [remote:*] du
+    # config.ini, que parse_args ne voit structurellement pas. Le contrôle placé
+    # ici ne couvrait que --remote, donc un remote de config.ini passait et
+    # dump_round() l'ignorait en silence — exactement le mensonge visé.
     # Valeurs non overridables via CLI (viennent du config.ini uniquement)
     args.lang       = defaults['lang']
     args.mode       = defaults['mode']
@@ -299,6 +419,26 @@ STRINGS = {
         'lang_en':        'English',
         'monitor_idx':    'Moniteur',
         'monitor_primary':'principal',
+        # machines distantes
+        'tab_remotes':      'Distants',
+        'rm_label':         'Distants',
+        'rm_ok':            'ok',
+        'rm_stale':         'périmé',
+        'rm_down':          'injoignable',
+        'rm_auth':          'auth refusée',
+        'rm_starting':      'démarrage',
+        'rm_dead':          'thread arrêté',
+        'off':              'désactivée',
+        'rm_stale_row':     'périmé',
+        'tip_remote':       'Session distante ({label}) — lecture seule : ni focus, ni fermeture.',
+        'rm_none':          'aucune session distante',
+        'rm_col_name':      'Nom',
+        'rm_col_url':       'URL',
+        'rm_col_health':    'État',
+        'rm_none_configured': 'Aucune machine distante configurée.',
+        'rm_readonly_hint': ('Lecture seule : les machines distantes se déclarent dans '
+                            '~/.config/claude-watcher/config.ini (sections [remote:<nom>]) '
+                            'ou avec --remote NAME=URL, et sont lues au démarrage.'),
     },
     'en': {
         # main widget
@@ -400,12 +540,37 @@ STRINGS = {
         'lang_en':        'English',
         'monitor_idx':    'Monitor',
         'monitor_primary':'primary',
+        # remote machines
+        'tab_remotes':      'Remotes',
+        'rm_label':         'Remotes',
+        'rm_ok':            'ok',
+        'rm_stale':         'stale',
+        'rm_down':          'down',
+        'rm_auth':          'auth failed',
+        'rm_starting':      'starting',
+        'rm_dead':          'poller stopped',
+        'off':              'off',
+        'rm_stale_row':     'stale',
+        'tip_remote':       'Remote session ({label}) — read-only: no focus, no close.',
+        'rm_none':          'no remote session',
+        'rm_col_name':      'Name',
+        'rm_col_url':       'URL',
+        'rm_col_health':    'Health',
+        'rm_none_configured': 'No remote machine configured.',
+        'rm_readonly_hint': ('Read-only: remote machines are declared in '
+                            '~/.config/claude-watcher/config.ini ([remote:<name>] sections) '
+                            'or with --remote NAME=URL, and are read at startup.'),
     },
 }
 
 def tr(key: str) -> str:
-    lang = getattr(CFG, 'lang', 'fr')
-    return STRINGS.get(lang, STRINGS['fr']).get(key, key)
+    # Repli en ANGLAIS, comme la TUI : `tr` est appelé par six aides du cœur
+    # PARTAGÉ, donc un repli différent d'un client à l'autre ferait diverger la
+    # sortie de fonctions par ailleurs identiques à l'octet près. Inatteignable
+    # en pratique (CFG.lang est posé dans main() avant tout appel), ce qui est
+    # précisément pourquoi personne ne l'aurait vu bouger.
+    lang = getattr(CFG, 'lang', 'en')
+    return STRINGS.get(lang, STRINGS['en']).get(key, key)
 
 # ── Couleurs ──────────────────────────────────────────────────────────────────
 
@@ -425,6 +590,7 @@ COLOR_BACKGROUND = "#5c8a9e"   # muted teal — un shell/tâche de fond tourne, 
 _PULSE_ALPHAS = [0.35, 0.6, 0.9, 1.0, 0.9, 0.6]
 COLOR_SNOOZE  = "#5a7a9a"
 COLOR_CLAUDE  = "#cc785c"   # Claude brand orange — marque les instances CLAUDE_CONFIG_DIR custom
+COLOR_REMOTE  = "#7a9ec2"   # bleu sourd — préfixe « <label>: » des lignes distantes
 COLOR_HOVER   = (1, 1, 1, 0.06)
 COLOR_HOVER_W = (0.91, 0.42, 0.14, 0.10)
 COLOR_KB_SEL  = (1, 1, 1, 0.14)
@@ -576,8 +742,13 @@ def resolve_config_dir(env: dict[str, str]) -> str | None:
     return config_dir
 
 
-def kill_session(pid: int, starttime: int, config_dir: str | None = None) -> bool:
+def kill_session(s: dict) -> bool:
     """Ferme une session Claude via SIGTERM, avec garde anti-recyclage de PID.
+
+    Prend le DICT de session, pas des primitives : la garde « session distante »
+    doit vivre au point d'étranglement, pas dans chaque appelant. Le pid d'une
+    ligne distante désigne un process LOCAL sans rapport — un kill qui fuit ne
+    rate pas, il tue la mauvaise chose sur CETTE machine.
 
     Réutilise get_session_registry, qui ne renvoie le registre QUE si procStart
     == starttime : un None ici = process disparu ou PID recyclé entre le scan et
@@ -585,7 +756,10 @@ def kill_session(pid: int, starttime: int, config_dir: str | None = None) -> boo
     son transcript et sortir proprement (pas de SIGKILL). Retourne True si le
     signal est parti.
     """
-    if get_session_registry(pid, starttime, config_dir) is None:
+    if s.get('remote'):
+        return False
+    pid = s['pid']
+    if get_session_registry(pid, s.get('starttime', 0), s.get('config_dir')) is None:
         return False
     try:
         os.kill(pid, signal.SIGTERM)
@@ -761,6 +935,13 @@ def cwd_to_project_dir(cwd: str | None, config_dir: str | None = None) -> Path |
     # pas du cwd du worktree. On retombe sur la racine projet. Inoffensif hors
     # worktree ; au pire le dir n'existe pas → None.
     root, _ = split_worktree(cwd)
+    # Racine VIDE ('/.claude/worktrees/wt') : le slug serait '' et `base / ''`
+    # vaut `base`, donc on rendrait le DOSSIER DES PROJETS comme s'il était un
+    # projet — et il existe toujours. Aucun repli ne convient ici (ni '' ni le
+    # cwd du worktree, qui n'est pas l'endroit où Claude range le transcript) :
+    # sans racine, il n'y a pas de projet à désigner.
+    if not root:
+        return None
     # Claude slugifie le cwd en remplaçant CHAQUE non-alphanumérique par '-'
     # (pas seulement '/'), donc 'geoffrey.laurent' → 'geoffrey-laurent'.
     slug = re.sub(r'[^a-zA-Z0-9]', '-', root)
@@ -1070,10 +1251,17 @@ def get_session_state(
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get('sessionId') if reg else None
-    if reg and not cwd:
-        cwd = reg.get('cwd')
+    # Le slug du transcript se calcule sur le cwd de DÉMARRAGE de la session, que
+    # le registre enregistre. Le cwd /proc dérive dès que le dossier est renommé
+    # ou que l'utilisateur fait un `cd` en cours de session — le slugifier
+    # désignerait un dossier projet inexistant et perdrait silencieusement
+    # état/ctx/sujet/last_activity. On préfère donc le cwd du REGISTRE pour
+    # résoudre le transcript ; le cwd vivant reste le libellé affiché (affaire de
+    # l'appelant). Précédence identique côté serveur (webui/detect.py) : la même
+    # session doit se lire pareil en local et via l'API.
+    transcript_cwd = (reg.get('cwd') if reg else None) or cwd
     jsonl_state, context_pct, tool, topic, last_activity = get_session_info_from_jsonl(
-        cwd, config_dir, session_id)
+        transcript_cwd, config_dir, session_id)
     if reg:
         # /rename : un nom choisi par l'utilisateur (champ `name` sans
         # nameSource='derived' — 'derived' = nom auto-généré, redondant avec le
@@ -1191,9 +1379,19 @@ def _focus_terminal_wayland(terminal_pid: int | None) -> bool:
     return False
 
 
-def focus_terminal(window_id: str | None, terminal_pid: int | None,
-                   kitty_socket: str | None = None,
-                   kitty_window_id: str | None = None) -> bool:
+def focus_terminal(s: dict) -> bool:
+    """Ramène au premier plan le terminal d'une session. Prend le DICT de session.
+
+    Même raison que kill_session : la garde « session distante » est au point
+    d'étranglement. Une session distante n'a pas de fenêtre ici — et son
+    window_id/terminal_pid désigneraient une fenêtre locale sans rapport.
+    """
+    if s.get('remote'):
+        return False
+    window_id       = s.get('window_id')
+    terminal_pid    = s.get('terminal_pid')
+    kitty_socket    = s.get('kitty_socket')
+    kitty_window_id = s.get('kitty_window_id')
     if IS_WAYLAND:
         return _focus_terminal_wayland(terminal_pid)
 
@@ -1241,7 +1439,8 @@ def focus_terminal(window_id: str | None, terminal_pid: int | None,
     return False
 
 
-def scan_sessions() -> list[dict]:
+def scan_local_sessions() -> list[dict]:
+    """Scan /proc de CETTE machine → lignes de session, non triées."""
     all_windows = get_all_windows()
     window_pids = {w['pid'] for w in all_windows}
 
@@ -1292,6 +1491,7 @@ def scan_sessions() -> list[dict]:
         kitty_socket    = env.get('KITTY_LISTEN_ON') or None
         kitty_window_id = env.get('KITTY_WINDOW_ID') or None
         raw_wid         = env.get('WINDOWID')
+        window_id: str | None
         if raw_wid:
             # WINDOWID est un entier décimal ; wmctrl -ia attend 0x...
             try:
@@ -1331,6 +1531,25 @@ def scan_sessions() -> list[dict]:
             'last_activity':   last_activity,
             'agents':          subagents.get(session_id, []) if session_id else [],
         })
+    return sessions
+
+
+def scan_sessions(remote_rows: list[dict] | None = None) -> list[dict]:
+    """Sessions locales + distantes, triées. `remote_rows` vient du cache du
+    poller (déjà adaptées) : AUCUN HTTP ici, la fonction tourne dans la boucle UI.
+    """
+    sessions: list[dict] = list(remote_rows or [])
+    if not getattr(CFG, 'no_local', False):
+        sessions.extend(scan_local_sessions())
+    # --hide-daemons / --no-agents s'appliquent APRÈS la fusion : filtrés dans le
+    # seul scan local, ils laissaient passer les lignes de démon distantes et les
+    # compteurs d'agents distants — l'option ne faisait donc que la moitié de ce
+    # qu'elle annonce. Les lignes distantes sont COPIÉES (dict(...)) : elles
+    # appartiennent au cache du poller, les muter le corromprait durablement.
+    if getattr(CFG, 'hide_daemons', False):
+        sessions = [s for s in sessions if not s.get('daemon')]
+    if not getattr(CFG, 'show_agents', True):
+        sessions = [dict(s, agents=[]) if s.get('agents') else s for s in sessions]
     # Priorité d'état (attente > travaille > idle) dans tous les modes. En mode
     # 'idle', SEUL le groupe inactif est départagé par ancienneté d'inactivité
     # (plus récemment devenu inactif en tête) ; attente/travaille gardent le tri
@@ -1354,30 +1573,793 @@ def scan_sessions() -> list[dict]:
             not s['waiting'], not s['working'], not s['background'], s['project'].lower()))
     return sessions
 
-# ── Session row ───────────────────────────────────────────────────────────────
+def session_key(s: dict) -> str:
+    """Clé de ligne. Le pid seul NE SUFFIT PAS dès qu'il y a des remotes : un pid
+    1234 local et un pid 1234 distant sont deux process différents et
+    collisionneraient (signature de structure identique → lignes mises à jour en
+    place avec les données d'une AUTRE session).
 
-def _session_tooltip(session: dict) -> str:
-    """Tooltip: full cwd + full topic (labels truncate both) + subagent list."""
-    tip = session['cwd']
-    if session.get('daemon'):
-        return f'{tip}\n\n{tr("tip_daemon")}'
-    topic = (session.get('topic') or '').strip()
+    On clé sur `remote_name` (le NOM de la section / du drapeau, unique par
+    construction) et JAMAIS sur `remote` (le label, élidé à REMOTE_LABEL_MAX) :
+    « build-server-01 » et « build-server-02 » donnent le même label élidé, donc
+    la même clé — et la signature de structure confondrait les deux machines.
+    """
+    r = s.get('remote_name') or s.get('remote')
+    return f"{r}:{s['pid']}" if r else str(s['pid'])
+
+
+# ── Sessions distantes ────────────────────────────────────────────────────────
+# Cœur partagé (stdlib uniquement, aucune dépendance à GTK) : agrège les
+# sessions d'autres machines servies par claude-watcher-webui (GET
+# /api/sessions). La TUI porte le même cœur + ses propres aides de présentation
+# (les constantes REMOTE_* vivent en tête de fichier). La parité du cœur est
+# vérifiée mécaniquement par tests/test_core_parity.py — un commentaire ne
+# retient personne, un test si.
+
+# Séquences ANSI (CSI/OSC/Fe) puis caractères de contrôle restants. Les chaînes
+# du payload sont écrites par une AUTRE machine et atterrissent dans des labels
+# Pango : sans ce nettoyage, un remote peut casser la mise en page (\r, \n) ou
+# usurper le label d'un autre remote. \n et \t sautent aussi — une ligne de
+# session tient sur une ligne.
+_ANSI_RE = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-Z\\-_]|\x1b\[[0-9;?]*[ -/]*[@-~]')
+# En plus des contrôles C0/C1 : les contrôles de FORMAT Unicode. U+202E (RLO) et
+# ses voisins réordonnent visuellement une chaîne — c'est la primitive d'usurpation
+# de label que la spec nomme elle-même ; U+2028/2029 sont des sauts de ligne pour
+# tout moteur de rendu et casseraient l'invariant « une ligne de session = une
+# ligne » ; U+200B–200D et U+2060–2069 sont invisibles ou isolent la direction.
+_CTRL_RE = re.compile(
+    '[\x00-\x1f\x7f-\x9f'
+    '\u061c'                    # ARABIC LETTER MARK
+    '\u200b-\u200f'             # ZWSP/ZWNJ/ZWJ, LRM/RLM
+    '\u2028-\u202e'             # LS/PS, LRE/RLE/PDF/LRO/RLO
+    '\u2060-\u2069'             # word joiner, invisibles, LRI/RLI/FSI/PDI
+    '\ufeff'                    # BOM (espace insécable de largeur nulle)
+    ']')
+
+
+def clean_remote_str(v: object, limit: int = 200) -> str | None:
+    """Chaîne venue du réseau → sûre pour l'affichage, ou None. FRONTIÈRE DE CONFIANCE."""
+    if not isinstance(v, str):
+        return None
+    return _CTRL_RE.sub('', _ANSI_RE.sub('', v))[:limit] or None
+
+
+def _as_int(v: object) -> int | None:
+    # isinstance(True, int) est vrai en Python : un booléen n'est pas un pid.
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def _as_float(v: object) -> float | None:
+    """Nombre fini, ou None. UNIQUE point d'entrée des flottants du réseau.
+
+    isinstance(float('inf'), float) est VRAI : sans le test de finitude,
+    `idle_seconds: Infinity` donnait last_activity = -inf, et format_idle levait
+    OverflowError DANS UN CALLBACK GLib.timeout_add — qui RETIRE la source
+    définitivement : le widget entier se fige, sessions locales comprises, et la
+    trace part sur un stderr qu'un widget lancé depuis le bureau n'a pas. Et ce
+    n'est pas réservé à un hôte hostile : json.dumps ÉMET `Infinity` par défaut
+    et json.loads l'accepte, donc un webui simplement buggé suffit. Un entier
+    gigantesque (10**400) fait lever float() lui-même — même traitement.
+    """
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    try:
+        f = float(v)
+    except (OverflowError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def mask_query(query: str) -> str:
+    """Valeurs de la query masquées : `?key=s3cr3t` → `?key=***`.
+
+    Le webui n'accepte PLUS le token en query : il ne lit que les en-têtes, et
+    son middleware d'accès journalise `query_params` à chaque requête — un token
+    posé là serait à la fois refusé et écrit en clair dans le log du serveur.
+    L'URL qu'on nous DONNE peut malgré tout en porter un, par habitude ou en
+    suivant une doc plus ancienne, et sans masquage il ressortait en clair dans
+    l'infobulle de ligne, la barre d'état et la boîte de dialogue de paramètres.
+    On masque TOUTE valeur : deviner laquelle est le secret est précisément ce
+    qu'on ne veut pas parier, et le masquage ne coûte rien.
+    """
+    if not query:
+        return ''
+    return '&'.join(f'{k}=***' if sep else k
+                    for k, sep, _v in (p.partition('=') for p in query.split('&')))
+
+
+def redact_secrets(msg: str, url: str) -> str:
+    """Masque dans un message d'erreur toute valeur de query de l'URL interrogée.
+
+    `display_url` est rédigée, mais l'URL réellement passée à urllib garde sa
+    query — il le FAUT : on ne réécrit pas l'URL qu'on nous a donnée (un reverse
+    proxy devant le webui peut exiger ses propres paramètres). Or n'importe
+    quelle exception qui cite l'URL (URL invalide, échec de connexion, timeout)
+    recopie donc dans `st['error']` tout secret que cette query contiendrait,
+    lequel est rendu dans l'infobulle de ligne, celle de la barre d'état, l'état
+    vide et la sortie de `--once`. Un simple espace collé dans la valeur suffit à
+    déclencher le cas.
+
+    On masque la valeur, pas la clé : c'est la valeur qui est le secret, et la
+    remplacer telle quelle couvre aussi bien la forme brute que celle réécrite
+    par urllib.
+    """
+    query = urllib.parse.urlsplit(url).query
+    if not query:
+        return msg
+    for part in query.split('&'):
+        _k, sep, value = part.partition('=')
+        # Seuil de longueur : le remplacement est une SOUS-CHAÎNE, donc une valeur
+        # courte mutile le diagnostic sans rien protéger — `?key=e` transformait
+        # « TimeoutError: timed out » en « Tim***outError: tim***d out ». En
+        # dessous de 4 caractères, ce n'est pas un secret qu'on défend.
+        if sep and len(value) >= 4:
+            msg = msg.replace(value, '***').replace(urllib.parse.quote(value, safe=''), '***')
+    return msg
+
+
+def split_remote_url(url: str) -> tuple[str, str | None, str]:
+    """URL avec userinfo → (url propre, token, url rédigée pour affichage).
+
+    urllib NE SAIT PAS traiter le userinfo (vérifié) : laissé en place,
+    Request.host devient « remote:tok@hote:8000 », aucun en-tête d'auth n'est
+    ajouté et la connexion meurt sur une résolution DNS de cette chaîne. On
+    découpe donc nous-mêmes, on garde le token de côté (envoyé en X-API-Key) et
+    on reconstruit une URL propre.
+
+    Le token est le MOT DE PASSE (« https://remote:tok@hote/ ») et, à défaut, le
+    NOM D'UTILISATEUR (« https://tok@hote/ ») — même règle que le serveur, donc
+    les deux bouts ne peuvent pas diverger. `(pwd or user)` et non
+    `(pwd if has_pwd else user)` : sur « https://tok:@hote/ » (mot de passe vide),
+    la seconde forme donnait None côté client là où le serveur retient « tok ».
+
+    La rédaction se fait ICI, à l'unique point d'analyse : le token vit dans la
+    chaîne d'URL, donc tout chemin qui affiche cette chaîne fuit tant qu'elle
+    n'est pas rédigée en amont. La QUERY est masquée dans les deux branches :
+    elle survit à l'absence de userinfo, et elle peut porter un secret que le
+    webui n'accepte plus mais que l'utilisateur y a laissé quand même.
+    On découpe la netloc à la main (et pas via u.hostname/u.port) pour préserver
+    la casse et les crochets d'une adresse IPv6.
+    """
+    u = urllib.parse.urlsplit(url)
+    shown_query = mask_query(u.query)
+    userinfo, sep, hostport = u.netloc.rpartition('@')
+    if not sep:
+        return url, None, urllib.parse.urlunsplit((u.scheme, u.netloc, u.path, shown_query, ''))
+    user, has_pwd, pwd = userinfo.partition(':')
+    token = (pwd or user) or None
+    clean = urllib.parse.urlunsplit((u.scheme, hostport, u.path, u.query, ''))
+    masked = f'{user}:***@{hostport}' if has_pwd else f'***@{hostport}'
+    return clean, token, urllib.parse.urlunsplit((u.scheme, masked, u.path, shown_query, ''))
+
+
+def remote_token_env(name: str) -> str:
+    """Nom de la variable d'environnement portant le token : `CW_REMOTE_TOKEN_<NOM>`."""
+    return 'CW_REMOTE_TOKEN_' + re.sub(r'[^A-Za-z0-9]', '_', name).upper()
+
+
+# Sémantique de configparser.getboolean, à la lettre. Seul « false » désactivait :
+# « no », « 0 » et « off » laissaient le remote ACTIF, donc le token continuait de
+# partir vers un hôte que l'utilisateur croyait éteint.
+_BOOL_TRUE  = frozenset({'1', 'yes', 'true', 'on'})
+_BOOL_FALSE = frozenset({'0', 'no', 'false', 'off'})
+
+
+def remote_enabled(value: object, where: str) -> bool:
+    """`enabled = …` → booléen. Lève ValueError sur une valeur ininterprétable.
+
+    On REFUSE bruyamment plutôt que de retomber sur « activé » : le mode de panne
+    d'une faute de frappe doit être « le watcher te le dit », pas « ton token
+    part quand même ».
+    """
+    if isinstance(value, bool):
+        return value
+    v = str(value).strip().lower()
+    if v in _BOOL_TRUE:
+        return True
+    if v in _BOOL_FALSE:
+        return False
+    raise ValueError(
+        f"{where} enabled = {value!r} : valeur booléenne invalide "
+        f"(attendu {'/'.join(sorted(_BOOL_TRUE))} ou {'/'.join(sorted(_BOOL_FALSE))})")
+
+
+def enabled_remotes(remotes: list[dict]) -> list[dict]:
+    """Les remotes actifs. UNIQUE application du filtre `enabled` : la liste
+    complète (désactivés compris) reste disponible pour l'écran de paramètres,
+    qui doit pouvoir montrer qu'un remote a bien été analysé mais est éteint."""
+    return [r for r in remotes if r.get('enabled', True)]
+
+
+def resolve_remotes(sections: dict[str, dict], flags: list[tuple[str, str]] | None,
+                    env: Mapping[str, str] | None = None) -> list[dict]:
+    """Sections [remote:<nom>] + drapeaux --remote → liste de remotes résolus.
+
+    Le drapeau NOMME un remote, il ne l'efface pas : son URL gagne pour ce run,
+    les autres clés de la section (token, label) survivent. Un remote déclaré en
+    ligne de commande est forcément voulu maintenant → enabled. Rien n'est jamais
+    réécrit dans le config.ini.
+
+    Ordre de résolution du token : userinfo de l'URL → CW_REMOTE_TOKEN_<NOM> →
+    section → aucun.
+
+    Lève ValueError sur un `enabled` ininterprétable ou sur deux noms qui
+    retombent sur la MÊME variable d'environnement (cf. plus bas).
+    """
+    env = os.environ if env is None else env
+    merged: dict[str, dict] = {}
+    for name, sec in sections.items():
+        merged[name] = {
+            'name':    name,
+            'url':     (sec.get('url') or '').strip(),
+            'token':   (sec.get('token') or '').strip() or None,
+            'label':   (sec.get('label') or '').strip() or name,
+            'enabled': remote_enabled(sec.get('enabled', 'true'), f'[remote:{name}]'),
+        }
+    for name, url in flags or []:
+        r = merged.setdefault(name, {'name': name, 'token': None, 'label': name})
+        r['url'], r['enabled'] = url, True
+
+    # `a-b`, `a.b`, `a_b` (et `lab` / `LAB`) donnent tous CW_REMOTE_TOKEN_A_B :
+    # le token d'un hôte de confiance partirait vers un hôte sans rapport. On
+    # détecte la collision ICI, au moment de résoudre, plutôt que de choisir
+    # arbitrairement un gagnant.
+    by_env: dict[str, list[str]] = {}
+    for name, r in merged.items():
+        if r.get('url'):   # une section sans url est ignorée : ne pas la compter
+            by_env.setdefault(remote_token_env(name), []).append(name)
+    for var, names in by_env.items():
+        if len(names) > 1 and var in env:
+            raise ValueError(
+                f"remotes {', '.join(sorted(names))} : mêmes variable d'environnement "
+                f"de token ({var}). Renommez-en un — sinon le token de l'un partirait "
+                f"vers l'autre.")
+
+    remotes = []
+    for r in merged.values():
+        if not r['url']:
+            continue
+        r['url'], url_token, r['display_url'] = split_remote_url(r['url'])
+        r['token'] = url_token or env.get(remote_token_env(r['name'])) or r['token']
+        # Label trop bavard : élidé ici, une fois — sinon il mangerait le projet.
+        if len(r['label']) > REMOTE_LABEL_MAX:
+            r['label'] = r['label'][:REMOTE_LABEL_MAX - 1] + '…'
+        remotes.append(r)
+    return remotes
+
+
+def adapt_remote_agents(raw: object) -> list[dict]:
+    """Liste d'agents du payload → liste nettoyée (sortie de adapt_remote_row).
+
+    Une entrée sans nom exploitable est jetée : elle n'aurait rien à afficher.
+    """
+    agents: list[dict] = []
+    if not isinstance(raw, list):
+        return agents
+    for a in raw[:50]:
+        if not isinstance(a, dict):
+            continue
+        name = clean_remote_str(a.get('name'), 60)
+        if name:
+            agents.append({'pid':   _as_int(a.get('pid')),
+                           'name':  name,
+                           'type':  clean_remote_str(a.get('type'), 60),
+                           'model': clean_remote_str(a.get('model'), 60)})
+    return agents
+
+
+def remote_last_activity(idle: float | None, received_at: float,
+                         age_seconds: float) -> float | None:
+    """Instant de dernière activité, en horloge MURALE LOCALE.
+
+    On n'importe qu'une DURÉE (inactivité mesurée là-bas + âge du snapshot) et on
+    la soustrait à l'instant de réception LOCAL : immunisé contre une dérive
+    d'horloge murale entre les deux machines. Le rendu compare ensuite
+    last_activity à time.time() local, exactement comme pour une session locale
+    — c'est pourquoi cette valeur reste en horloge murale alors que la
+    péremption d'un remote, elle, est mesurée en monotone.
+    """
+    if idle is None:
+        return None
+    # Les DEUX termes sous le même plafond, pas seulement `idle` : `_as_float` ne
+    # rejette que les non-finis, donc un `age_seconds` de 1e308 rouvrait la cellule
+    # de 311 caractères que ce plafond ferme — le correctif avait borné un opérande
+    # en laissant son voisin sur l'ancienne hypothèse.
+    return received_at - min(float(REMOTE_MAX_ELAPSED_S),
+                            max(0.0, idle) + max(0.0, age_seconds))
+
+
+def adapt_remote_row(row: object, remote: dict, received_at: float,
+                     age_seconds: float = 0.0) -> dict | None:
+    """Ligne d'API → dict de session locale, ou None si la ligne est inexploitable.
+
+    Frontière de confiance : la FORME est validée autant que le contenu (chaque
+    champ est converti, une ligne qui ne rentre pas est jetée, les autres
+    passent). Un champ absent dégrade, il n'échoue pas — on met à jour un client
+    avant d'avoir mis à jour tous les hôtes qu'il regarde.
+    """
+    if not isinstance(row, dict):
+        return None
+    pid = _as_int(row.get('pid'))
+    if pid is None:
+        return None
+    state = row.get('state')
+    if state not in ('waiting', 'working', 'background', 'idle', 'daemon'):
+        state = 'idle'
+    idle = _as_float(row.get('idle_seconds'))
+    last_activity = remote_last_activity(idle, received_at, age_seconds)
+    pct = _as_int(row.get('context_pct'))
+    cwd = clean_remote_str(row.get('cwd'), 300) or '?'
+    agents = adapt_remote_agents(row.get('agents'))
+    return {
+        'pid':             pid,
+        'starttime':       0,
+        'project':         clean_remote_str(row.get('project'), 80) or '?',
+        'worktree':        clean_remote_str(row.get('worktree'), 80),
+        'display_cwd':     clean_remote_str(row.get('display_cwd'), 300) or cwd,
+        'last_activity':   last_activity,
+        'topic':           clean_remote_str(row.get('topic'), 400),
+        'cwd':             cwd,
+        # Plafonné : un elapsed importé sans borne (2**63) s'affiche
+        # « 2562047788015215h30m » et fait déborder la cellule.
+        'elapsed':         min(REMOTE_MAX_ELAPSED_S, max(0, _as_int(row.get('elapsed')) or 0)),
+        'waiting':         state == 'waiting',
+        'working':         state == 'working',
+        'background':      state == 'background',
+        'context_pct':     min(100, max(0, pct)) if pct is not None else None,
+        'tool':            clean_remote_str(row.get('tool'), 40),
+        # Rien de local ne doit pouvoir être visé depuis une ligne distante.
+        'terminal_pid':    None,
+        'window_id':       None,
+        'kitty_socket':    None,
+        'kitty_window_id': None,
+        # Affichage seulement : _sync_status_monitors ne DOIT PAS en faire un
+        # chemin local (le ~/.claude d'un remote existe aussi ici).
+        'config_dir':      clean_remote_str(row.get('config_dir'), 60),
+        'agents':          agents,
+        'daemon':          bool(row.get('daemon')) or state == 'daemon',
+        'remote':          remote['label'],
+        'remote_name':     remote['name'],
+    }
+
+
+def adapt_remote_payload(payload: object, remote: dict,
+                         received_at: float) -> tuple[list[dict], int]:
+    """Payload /api/sessions → (lignes de session, nombre de lignes ANNONCÉES).
+
+    Les mauvaises lignes sont jetées. Le total annoncé est renvoyé à part pour
+    que la zone d'état puisse dire « 500/612 » : tronquer à REMOTE_MAX_ROWS en
+    silence donne une liste qui a l'air complète.
+    """
+    if not isinstance(payload, dict):
+        return [], 0
+    rows = payload.get('sessions')
+    if not isinstance(rows, list):
+        return [], 0
+    # age_seconds absent = webui antérieur à la mise en cache : 0.0, et le remote
+    # marche. Coût maximal : un TTL de précision sur l'inactivité affichée.
+    age = max(0.0, _as_float(payload.get('age_seconds')) or 0.0)
+    adapted = (adapt_remote_row(r, remote, received_at, age) for r in rows[:REMOTE_MAX_ROWS])
+    return [r for r in adapted if r is not None], len(rows)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Ne suit AUCUNE redirection : la redirection devient une HTTPError 3xx.
+
+    Mesuré : l'ouvreur par défaut d'urllib suit les 3xx en REJOUANT les en-têtes
+    de la requête — donc notre X-API-Key — vers la cible, y compris sur un autre
+    hôte et en dégradant https → http. Un remote mal saisi ou compromis
+    exfiltrerait le token avec une seule 302. Aucun besoin légitime de
+    redirection ici : /api/sessions est servi directement.
+    """
+
+    def redirect_request(self, req: urllib.request.Request, fp: Any, code: int,
+                         msg: str, headers: Any, newurl: str) -> None:
+        return None
+
+
+_REMOTE_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def remote_endpoint(url: str) -> str:
+    """URL de base → endpoint /api/sessions, en joignant sur le CHEMIN.
+
+    `'https://box/?x=1'.rstrip('/') + '/api/sessions'` donnait
+    « https://box/?x=1/api/sessions » : la query avalait le chemin et le endpoint
+    n'était jamais demandé. La query reçue est préservée telle quelle — on ne
+    réécrit pas l'URL qu'on nous a donnée (un reverse proxy devant le webui peut
+    exiger ses propres paramètres). Le token, lui, n'y est JAMAIS ajouté par
+    nous : il part en en-tête `X-API-Key` (cf. fetch_remote), seule forme que le
+    webui accepte encore — et la query, elle, est journalisée côté serveur.
+    """
+    u = urllib.parse.urlsplit(url)
+    if u.scheme not in REMOTE_SCHEMES:
+        # file:// serait lu par l'ouvreur par défaut d'urllib : une faute de
+        # frappe deviendrait une lecture de fichier local rendue comme des
+        # sessions vivantes.
+        raise ValueError(f"schéma non supporté : {u.scheme or '(aucun)'} "
+                         f"(attendu {' ou '.join(REMOTE_SCHEMES)})")
+    return urllib.parse.urlunsplit(
+        (u.scheme, u.netloc, u.path.rstrip('/') + '/api/sessions', u.query, ''))
+
+
+def read_capped(resp: Any, deadline: float) -> bytes:
+    """Corps de réponse, au plus REMOTE_MAX_BYTES + 1 octets et avant `deadline`.
+
+    Lecture par tranches, et pas un `read(MAX + 1)` unique : le timeout d'urlopen
+    est PAR OPÉRATION socket, donc un pair qui livre un octet toutes les 4 s ne le
+    déclenche jamais et parque le thread indéfiniment — ce qui défait aussi
+    stop(). Le budget total est vérifié entre deux tranches (horloge monotone :
+    un pas NTP ne doit pas rallonger ni écourter le budget).
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while total <= REMOTE_MAX_BYTES:
+        if time.monotonic() > deadline:
+            raise TimeoutError('lecture trop lente')
+        chunk = resp.read(min(REMOTE_READ_CHUNK, REMOTE_MAX_BYTES + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b''.join(chunks)
+
+
+def fetch_remote(remote: dict,
+                 opener: Callable[..., Any] = _REMOTE_OPENER.open,
+                 ) -> tuple[list[dict], str | None, int | None, int]:
+    """Interroge un remote → (lignes, erreur, code HTTP, lignes annoncées).
+
+    Ne lève JAMAIS : cette fonction est le corps d'un thread de poll, et une
+    exception qui s'en échappe tue le thread pour de bon.
+
+    La construction de la Request est DANS le try : `--remote lab=myhost` (sans
+    schéma) lève ValueError, et hors du try elle tuait le thread au premier tour
+    sans rien enregistrer — infobulle vide, état vide, « aucune session active »
+    pour un remote mal configuré.
+
+    timeout couvre connexion ET chaque opération socket ; la lecture a en plus un
+    budget total ; le corps est plafonné à 4 MiB (un read() non borné sur une
+    socket distante est une bombe mémoire que l'UI ne survit pas) ; les
+    redirections ne sont pas suivies (cf. _NoRedirect).
+    """
+    try:
+        req = urllib.request.Request(remote_endpoint(remote['url']),
+                                     headers={'User-Agent': 'claude-watcher-gtk',
+                                              'Accept': 'application/json'})
+        if remote.get('token'):
+            req.add_header('X-API-Key', remote['token'])
+        with opener(req, timeout=REMOTE_TIMEOUT_S) as resp:
+            raw = read_capped(resp, time.monotonic() + REMOTE_READ_BUDGET_S)
+        if len(raw) > REMOTE_MAX_BYTES:
+            return [], f'> {REMOTE_MAX_BYTES // (1024 * 1024)} MiB', None, 0
+        payload = json.loads(raw.decode('utf-8', 'replace'))
+    except urllib.error.HTTPError as e:
+        return [], f'HTTP {e.code}', e.code, 0
+    except Exception as e:
+        # Tout le reste (URLError, timeout, URL invalide, JSON invalide,
+        # décodage…) : le thread ne doit jamais mourir sur un hôte qui répond
+        # n'importe quoi — ni sur une URL mal saisie.
+        # Le texte d'erreur est SOUS CONTRÔLE DU SERVEUR (mesuré : une ligne de
+        # statut bidon arrive telle quelle dans BadStatusLine, échappements ANSI
+        # compris) et finit à l'écran → même nettoyage que le reste du payload.
+        msg = redact_secrets(f'{type(e).__name__}: {e}', remote.get('url', ''))
+        return [], clean_remote_str(msg, 120) or type(e).__name__, None, 0
+    rows, total = adapt_remote_payload(payload, remote, time.time())
+    return rows, None, None, total
+
+
+def remote_health(st: dict, poll_s: float, now: float) -> tuple[str, float | None]:
+    """(santé, âge de la donnée) — 'ok' | 'stale' | 'auth' | 'down' | 'starting' | 'dead'.
+
+    `now` est une horloge MONOTONE, comme le `received_mono` qu'elle compare : la
+    péremption est TOUT le contrat de cette fonctionnalité, et en horloge murale
+    un pas NTP arrière ou un portable qui sort de veille rendait `max(0, now-ra)`
+    positif et donc frais — un remote mort depuis une journée lisait « ok ».
+    (`last_activity`, lui, reste en horloge murale : il est comparé à time.time()
+    au rendu. Deux horloges, deux métiers.)
+
+    « jamais répondu » (down) et « répondait, ne répond plus » (stale) sont
+    distincts : un remote qui n'a JAMAIS répondu n'a aucune ligne à marquer
+    périmée, il serait invisible sans la zone d'état. « starting » les distingue
+    tous deux du cas normal « le premier poll n'est pas encore revenu », qui
+    n'est pas une panne.
+
+    'dead' : le thread de poll n'est plus là. Sans cet état, un thread mort après
+    un premier succès lisait « ok » puis « périmé » POUR TOUJOURS — une donnée
+    vieille d'un jour indiscernable d'un hôte ayant manqué deux polls.
+    """
+    ra = st.get('received_mono')
+    age = None if ra is None else max(0.0, now - ra)
+    if st.get('alive') is False:
+        return 'dead', age
+    if age is not None and age <= REMOTE_STALE_X * poll_s:
+        return 'ok', age
+    if st.get('status') in (401, 403):
+        return 'auth', age
+    if age is None:
+        return ('down' if st.get('error') else 'starting'), None
+    return 'stale', age
+
+
+def remote_health_text(st: dict, poll_s: float, now: float) -> str:
+    """Santé seule : « ok 3 » (joignable, 3 sessions) vs « injoignable » /
+    « périmé 42s ». Confondre les deux premiers est exactement le mode de panne
+    que cette fonctionnalité doit éviter : sans ça, les deux donnent la même
+    liste vide.
+
+    « ok 500/612 » quand le payload dépassait REMOTE_MAX_ROWS : tronquer en
+    silence donne une liste qui a l'air complète.
+    """
+    health, age = remote_health(st, poll_s, now)
+    if health == 'ok':
+        shown = len(st.get('rows') or [])
+        total = st.get('total') or shown
+        count = f'{shown}/{total}' if total > shown else str(shown)
+        return f"{tr('rm_ok')} {count}"
+    if health == 'auth':
+        return tr('rm_auth')
+    if health == 'starting':
+        return tr('rm_starting')
+    if health == 'dead':
+        return tr('rm_dead')
+    if health == 'stale' and age is not None:
+        return f"{tr('rm_stale')} {format_elapsed(age)}"
+    return tr('rm_down')
+
+
+def remote_status_text(remote: dict, st: dict, poll_s: float, now: float) -> str:
+    """Fragment de la zone d'état : « lab ok 0 » / « lab injoignable »."""
+    return f"{remote['label']} {remote_health_text(st, poll_s, now)}"
+
+
+def local_config_dirs(sessions: list[dict]) -> list[str]:
+    """config_dir des lignes LOCALES uniquement.
+
+    Le config_dir d'une ligne distante est un chemin de l'AUTRE machine, et le
+    ~/.claude d'un remote existe aussi ici : la boucle naïve poserait un monitor
+    local pour le compte d'un remote. Même classe de bug que la collision de pid,
+    rayon d'action plus faible.
+    """
+    return [s['config_dir'] for s in sessions
+            if s.get('config_dir') and not s.get('remote')]
+
+
+def remotes_bar_text(remotes: list[dict], stat: dict[str, dict],
+                     poll_s: float, now: float) -> str:
+    """Contenu de la zone d'état : un fragment par remote CONFIGURÉ, session ou pas."""
+    return f"{tr('rm_label')}: " + ' · '.join(
+        remote_status_text(r, stat.get(r['name'], {}), poll_s, now) for r in remotes)
+
+
+def remotes_bar_tooltip(remotes: list[dict], stat: dict[str, dict]) -> str:
+    """Infobulle de la zone d'état : URL RÉDIGÉE + erreur courante par remote."""
+    lines = []
+    for r in remotes:
+        st = stat.get(r['name'], {})
+        lines.append(f"{r['label']} — {st.get('display_url', r.get('display_url', ''))}"
+                     + (f"\n  {st['error']}" if st.get('error') else ''))
+    return '\n'.join(lines)
+
+
+def empty_state_text(remotes: list[dict], stat: dict[str, dict]) -> str:
+    """« aucune session active » serait un mensonge quand des remotes ont été
+    interrogés sans succès : on dit lesquels, et pourquoi."""
+    failed = [f"{r['label']}: {stat[r['name']].get('error')}"
+              for r in remotes
+              if stat.get(r['name'], {}).get('error')]
+    return '\n'.join([tr('rm_none'), *failed]) if failed else tr('no_session')
+
+
+def remote_stale_text(rstate: dict | None) -> str | None:
+    """« ⚠ périmé 42s » quand la donnée d'un remote dépasse 3 × l'intervalle de poll.
+
+    La ligne est CONSERVÉE (la jeter ferait clignoter la liste au moindre poll
+    manqué) mais elle affiche l'âge de la donnée.
+    """
+    if not rstate or rstate.get('health') in ('ok', 'starting'):
+        return None
+    age = rstate.get('age')
+    return f"⚠ {tr('rm_stale_row')}" + (f' {format_elapsed(age)}' if age is not None else '')
+
+
+def session_tooltip(s: dict, rstate: dict | None = None) -> str:
+    """Infobulle de ligne : chemin complet + sujet complet (les labels tronquent)
+    + liste des sous-agents.
+
+    Ligne distante : URL RÉDIGÉE (le token vit dans l'URL) + erreur courante —
+    seul moyen de savoir quelle machine se cache derrière un label. C'est aussi
+    là que la lecture seule est ÉNONCÉE : le widget retire les affordances
+    (focus, fermeture) au lieu de les laisser échouer, exactement comme pour une
+    ligne de démon, et l'infobulle dit pourquoi. Cacher sans dire serait un
+    silence ; dire sans cacher serait une promesse non tenue.
+    """
+    tip = s['cwd']
+    label = s.get('remote')
+    if label:
+        tip = (f"{tip}\n\n{tr('tip_remote').format(label=label)}"
+               f"\n{(rstate or {}).get('display_url', '')}")
+        if rstate and rstate.get('error'):
+            tip = f"{tip}\n{rstate['error']}"
+        stale = remote_stale_text(rstate)
+        if stale:
+            tip = f"{tip}\n{stale}"
+    if s.get('daemon'):
+        return f"{tip}\n\n{tr('tip_daemon')}"
+    topic = (s.get('topic') or '').strip()
     if topic:
         tip = f'{tip}\n\nTopic: {topic}'
-    agents = session.get('agents') or []
+    agents = s.get('agents') or []
     if agents:
         lines = []
         for a in agents:
             detail = ', '.join(x for x in (a.get('type'), a.get('model')) if x)
-            lines.append(f' • {a["name"]}' + (f' ({detail})' if detail else ''))
-        tip = f'{tip}\n\n{tr("tip_agents")}\n' + '\n'.join(lines)
+            lines.append(f" • {a['name']}" + (f' ({detail})' if detail else ''))
+        tip = f"{tip}\n\n{tr('tip_agents')}\n" + '\n'.join(lines)
     return tip
 
 
+def remote_rstate(s: dict, stat: dict[str, dict], poll_s: float,
+                  now_mono: float) -> dict | None:
+    """État du remote d'une ligne : santé, âge de la donnée, URL rédigée, erreur.
+    None pour une ligne locale. `now_mono` est une horloge MONOTONE."""
+    if not s.get('remote'):
+        return None
+    st = stat.get(s.get('remote_name') or '')
+    if st is None:
+        return None
+    health, age = remote_health(st, poll_s, now_mono)
+    return {'health': health, 'age': age, 'error': st.get('error'),
+            'display_url': st.get('display_url', '')}
+
+
+def remotes_panel_rows(remotes: list[dict], stat: dict[str, dict],
+                       poll_s: float, now: float) -> list[tuple[str, str, str]]:
+    """(nom, URL rédigée, santé) par remote configuré — panneau lecture seule des
+    paramètres. Les remotes DÉSACTIVÉS y figurent aussi : sans eux, rien ne dit
+    qu'un `[remote:*]` a bien été analysé mais est éteint."""
+    rows = []
+    for r in remotes:
+        st = stat.get(r['name'], {})
+        health = (remote_health_text(st, poll_s, now) if r.get('enabled', True)
+                  else tr('off'))
+        rows.append((r['name'], st.get('display_url', r.get('display_url', '')), health))
+    return rows
+
+
+class RemotePoller:
+    """Un thread démon par remote actif ; cache {nom: état} sous verrou.
+
+    Chaque thread boucle SÉQUENTIELLEMENT (requête, puis attente) : un hôte lent
+    ne ralentit que lui-même, les requêtes ne s'empilent jamais, et un remote mort
+    n'affecte pas les autres. `sessions()` et `snapshot()` ne font AUCUN HTTP —
+    ils sont appelés depuis la boucle GTK.
+
+    Aucun widget n'est touché ici : le thread appelle `notify` (côté GTK :
+    GLib.idle_add), qui replanifie le rafraîchissement dans la boucle principale.
+    La TUI se rafraîchit sur son propre timer et ne passe pas de notify.
+
+    La liste reçue est déjà filtrée sur `enabled` (cf. enabled_remotes, appliqué
+    une seule fois à la résolution) : ce constructeur ne refiltre pas.
+    """
+
+    def __init__(self, remotes: list[dict], poll_ms: int = REMOTE_POLL_MS,
+                 notify: Callable[[], None] | None = None) -> None:
+        self.remotes = list(remotes)
+        self.poll_s = max(REMOTE_POLL_MIN_MS / 1000, poll_ms / 1000)
+        self._notify = notify
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        # `received_mono` et non `received_at` : c'est une horloge MONOTONE, et
+        # le nom doit l'annoncer — la confondre avec l'horloge murale est
+        # exactement le bug que la péremption ne peut pas se permettre.
+        self._state = {r['name']: {'rows': [], 'received_mono': None, 'error': None,
+                                   'status': None, 'total': 0, 'alive': None,
+                                   'display_url': r.get('display_url', '')}
+                       for r in self.remotes}
+
+    def start(self) -> None:
+        for r in self.remotes:
+            with self._lock:
+                self._state[r['name']]['alive'] = True
+            threading.Thread(target=self._loop, args=(r,), daemon=True,
+                             name=f"remote-{r['name']}").start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def snapshot(self) -> dict[str, dict]:
+        with self._lock:
+            return {k: dict(v) for k, v in self._state.items()}
+
+    def sessions(self) -> list[dict]:
+        """Dernières lignes connues de tous les remotes (conservées en cas d'échec :
+        les jeter ferait clignoter la liste au moindre poll manqué, et le marqueur
+        « périmé » dit déjà qu'elles sont vieilles)."""
+        with self._lock:
+            return [row for st in self._state.values() for row in st['rows']]
+
+    def _backoff(self, fails: int, status: int | None) -> float:
+        delay = min(self.poll_s * 2 ** min(fails, 5), REMOTE_BACKOFF_MAX_S)
+        if status in (401, 403):
+            # Mauvais token : réessayer toutes les 2 s ne le corrigera pas.
+            delay = max(delay, REMOTE_AUTH_RETRY_S)
+        return delay
+
+    def _loop(self, remote: dict) -> None:
+        """Boucle de poll. Ne lève JAMAIS — et c'est GARANTI ici, pas promis.
+
+        Rien ne gardait ce corps : une levée (depuis notify — donc depuis
+        GLib.idle_add côté GTK —, depuis un callback, depuis n'importe quoi)
+        terminait le thread. Et comme `received_mono` était déjà posé, le remote
+        lisait « ok » pendant 3 × l'intervalle puis « périmé » POUR TOUJOURS —
+        un instantané vieux d'un jour indiscernable d'un hôte ayant manqué deux
+        polls. D'où : corps gardé, erreur enregistrée, et `alive=False` en sortie
+        pour que le thread disparu ne puisse plus jamais lire « ok ».
+        """
+        fails = 0
+        try:
+            while not self._stop.is_set():
+                try:
+                    rows, error, status, total = fetch_remote(remote)
+                    with self._lock:
+                        st = self._state[remote['name']]
+                        st['error'], st['status'] = error, status
+                        if error is None:
+                            st['rows'], st['total'] = rows, total
+                            st['received_mono'] = time.monotonic()
+                    # Le thread ne touche AUCUN widget : il demande juste à la
+                    # boucle principale de se rafraîchir (GLib.idle_add côté
+                    # appelant).
+                    if self._notify is not None and not self._stop.is_set():
+                        self._notify()
+                    if error is None:
+                        fails, delay = 0, self.poll_s
+                    else:
+                        fails += 1
+                        delay = self._backoff(fails, status)
+                except Exception as e:
+                    fails += 1
+                    delay = self._backoff(fails, None)
+                    msg = redact_secrets(f'{type(e).__name__}: {e}', remote.get('url', ''))
+                    with self._lock:
+                        self._state[remote['name']]['error'] = (
+                            clean_remote_str(msg, 120)
+                            or type(e).__name__)
+                self._stop.wait(delay)
+        finally:
+            with self._lock:
+                self._state[remote['name']]['alive'] = False
+
+
+# ── Session row ───────────────────────────────────────────────────────────────
+
+def session_project_markup(s: dict) -> str:
+    """Markup Pango du libellé projet.
+
+    Ligne distante : préfixe « <label>: » (convention scp/rsync, pas besoin de
+    légende) ; une ligne locale reste NUE. Le préfixe est en TÊTE du markup et
+    l'ellipsage du label est en mode END : le marqueur survit donc à la
+    troncature par construction — là où la TUI doit réserver le budget avant de
+    tronquer par la gauche.
+    """
+    prefix = (f'<span foreground="{COLOR_CLAUDE}" weight="bold">(D)</span> '
+              if s.get('daemon') else '')
+    label = s.get('remote')
+    if label:
+        prefix += (f'<span foreground="{COLOR_REMOTE}">'
+                   f'{GLib.markup_escape_text(label)}:</span>')
+    return (f'<span foreground="{TEXT_PRIMARY}" font="Monospace 9" weight="500">'
+            f'{prefix}{GLib.markup_escape_text(s["project"])}</span>')
+
+
 class SessionRow(Gtk.EventBox):
-    def __init__(self, session: dict):
+    def __init__(self, session: dict, rstate: dict | None = None):
         super().__init__()
         self.session  = session
+        # État du remote de cette ligne (santé, âge, URL rédigée, erreur), calculé
+        # par la fenêtre depuis le cache du poller. None pour une ligne locale.
+        self.rstate   = rstate
         self._hovered     = False
         self._kb_selected = False
         self._ctx_menu    = None
@@ -1389,7 +2371,7 @@ class SessionRow(Gtk.EventBox):
         # Survol : chemin de travail complet + sujet complet (les labels tronquent
         # — projet aux 2 derniers segments, sujet à la 1re ligne ellipsée)
         # + détail des subagents.
-        self.set_tooltip_text(_session_tooltip(session))
+        self.set_tooltip_text(session_tooltip(session, rstate))
         self.set_visible_window(True)
         self.connect('button-press-event', self._on_click)
         self.connect('enter-notify-event',  self._on_enter)
@@ -1474,7 +2456,7 @@ class SessionRow(Gtk.EventBox):
         self._update_labels()
         self.show_all()
 
-    def update_session(self, session: dict):
+    def update_session(self, session: dict, rstate: dict | None = None):
         """Met à jour la ligne EN PLACE (pas de recréation).
 
         Réécrit tooltip + labels + couleur du point depuis la nouvelle session,
@@ -1483,7 +2465,8 @@ class SessionRow(Gtk.EventBox):
         _rebuild_sessions quand la structure (pids/colonnes) est inchangée.
         """
         self.session = session
-        self.set_tooltip_text(_session_tooltip(session))
+        self.rstate  = rstate
+        self.set_tooltip_text(session_tooltip(session, rstate))
         self._update_labels()
         self.dot.queue_draw()
 
@@ -1502,12 +2485,9 @@ class SessionRow(Gtk.EventBox):
         else:
             color, badge_txt = COLOR_IDLE, tr('idle')
         self._dot_color = color
-        # Préfixe « (D) » en orange Claude pour repérer le démon d'un coup d'œil.
-        prefix = f'<span foreground="{COLOR_CLAUDE}" weight="bold">(D)</span> ' if daemon else ''
-        self.lbl_project.set_markup(
-            f'<span foreground="{TEXT_PRIMARY}" font="Monospace 9" weight="500">'
-            f'{prefix}{GLib.markup_escape_text(s["project"])}</span>'
-        )
+        # Préfixe « (D) » (démon) et « <label>: » (ligne distante) : cf.
+        # session_project_markup.
+        self.lbl_project.set_markup(session_project_markup(s))
         worktree = s.get('worktree')
         if worktree:
             self.lbl_worktree.set_markup(
@@ -1546,6 +2526,12 @@ class SessionRow(Gtk.EventBox):
             meta += (
                 f' <span foreground="{COLOR_CLAUDE}" font="Monospace 8">'
                 f'{CLAUDE_IDLE_GLYPH}{GLib.markup_escape_text(cfg)}</span>'
+            )
+        stale = remote_stale_text(self.rstate)
+        if stale:
+            meta += (
+                f' <span foreground="{COLOR_WAITING}" font="Monospace 8">'
+                f'{GLib.markup_escape_text(stale)}</span>'
             )
         self.lbl_meta.set_markup(meta)
         tool = s.get('tool') if (s['working'] or s['waiting']) else None
@@ -1609,8 +2595,9 @@ class SessionRow(Gtk.EventBox):
             return
         self._hovered = True
         # Curseur « main » pour signaler le clic-focus ; flèche par défaut pour le
-        # démon, qui n'est pas focusable.
-        cursor_name = 'default' if self.session.get('daemon') else 'pointer'
+        # démon et les sessions distantes, qui ne sont pas focusables.
+        cursor_name = ('default' if (self.session.get('daemon') or self.session.get('remote'))
+                       else 'pointer')
         self.get_window().set_cursor(Gdk.Cursor.new_from_name(self.get_display(), cursor_name))
         self.queue_draw()
 
@@ -1624,16 +2611,14 @@ class SessionRow(Gtk.EventBox):
             self.queue_draw()
 
     def _do_focus(self):
-        # Le démon n'a pas de terminal : rien à focus. Garde unique couvrant les
-        # trois entrées (clic gauche, menu, Entrée clavier).
-        if self.session.get('daemon'):
+        # Le démon n'a pas de terminal : rien à focus. Une session distante non
+        # plus, et son window_id/terminal_pid viseraient une fenêtre LOCALE sans
+        # rapport (la garde vit aussi dans focus_terminal, au point
+        # d'étranglement). Garde unique couvrant les trois entrées (clic gauche,
+        # menu, Entrée clavier).
+        if self.session.get('daemon') or self.session.get('remote'):
             return
-        focus_terminal(
-            self.session.get('window_id'),
-            self.session['terminal_pid'],
-            self.session.get('kitty_socket'),
-            self.session.get('kitty_window_id'),
-        )
+        focus_terminal(self.session)
 
     def _on_destroyed(self, *_):
         if self._ctx_menu is not None:
@@ -1654,8 +2639,9 @@ class SessionRow(Gtk.EventBox):
         # Référence gardée sur self : sinon le menu est ramassé par le GC avant
         # même de s'afficher.
         self._ctx_menu = menu = Gtk.Menu()
-        # Pas de « Focus » pour le démon : aucun terminal à activer.
-        if not s.get('daemon'):
+        # Pas de « Focus » pour le démon ni pour une session distante : aucun
+        # terminal à activer ici.
+        if not s.get('daemon') and not s.get('remote'):
             item_focus = Gtk.MenuItem.new_with_label(tr('menu_focus'))
             item_focus.connect('activate', lambda _m: self._do_focus())
             menu.append(item_focus)
@@ -1667,8 +2653,11 @@ class SessionRow(Gtk.EventBox):
         # « Fermer » réservé aux sessions inactives : on ne propose pas de tuer
         # une session qui travaille ou attend une réponse (tour en cours). Exclu
         # aussi pour le démon — pas une session (pas de registre keyé par pid),
-        # le kill échouerait systématiquement avec un message trompeur.
-        if not s['waiting'] and not s['working'] and not s.get('daemon'):
+        # le kill échouerait systématiquement avec un message trompeur — et pour
+        # une session distante : lecture seule (kill_session refuserait de toute
+        # façon, ici c'est l'UI qui ne le propose pas).
+        if not s['waiting'] and not s['working'] and not s.get('daemon') \
+                and not s.get('remote'):
             item_kill = Gtk.MenuItem.new_with_label(tr('menu_kill'))
             item_kill.connect('activate', lambda _m: self._confirm_kill())
             menu.append(item_kill)
@@ -1698,7 +2687,7 @@ class SessionRow(Gtk.EventBox):
 
     def _do_kill(self):
         s = self.session
-        if kill_session(s['pid'], s.get('starttime', 0), s.get('config_dir')):
+        if kill_session(s):
             return  # la ligne disparaîtra au prochain scan (process terminé)
         warn = Gtk.MessageDialog(
             transient_for=self.get_toplevel(), modal=True,
@@ -1716,9 +2705,16 @@ class SessionRow(Gtk.EventBox):
 class SettingsDialog(Gtk.Dialog):
     """Dialogue de configuration — accessible depuis le systray."""
 
-    def __init__(self, parent: 'ClaudeWatcher'):
+    def __init__(self, parent: 'ClaudeWatcher',
+                 remote_stat: dict[str, dict] | None = None,
+                 remote_poll_s: float = REMOTE_POLL_MS / 1000):
+        # L'état des remotes est PASSÉ, pas pioché dans parent._poller : le
+        # dialogue n'a pas à savoir qu'un poller existe (il n'en existe aucun
+        # quand rien n'est déclaré), et il lui faut de toute façon la liste
+        # complète, que le poller ne détient pas.
         super().__init__(title=tr('settings_title'), modal=True)
         self._parent = parent
+        remote_stat = remote_stat or {}
         self._original_values = {
             'lang':       CFG.lang,
             'free':       parent._user_pos is not None,
@@ -1978,8 +2974,48 @@ class SettingsDialog(Gtk.Dialog):
         self._combo_idle.set_active_id(getattr(CFG, 'idle_format', 'none'))
         gd.attach(self._combo_idle, 1, 8, 4, 1)
 
+        # ── Onglet Distants (LECTURE SEULE) ──────────────────────────────────
+        # Les remotes sont lus au démarrage : les modifier ici voudrait dire
+        # démarrer/arrêter des threads depuis l'UI, plus gros que la fonction
+        # qu'il servirait. On les AFFICHE (nom, URL rédigée, santé), on n'y
+        # touche pas.
+        # La liste vient de CFG (NON filtrée sur `enabled`) et pas du poller : ce
+        # dernier ne connaît que les remotes actifs, si bien qu'un `[remote:*]`
+        # éteint était totalement invisible ici — rien ne disait qu'il avait été
+        # analysé. Les éteints sont affichés grisés, avec « désactivée » en santé.
+        gr = make_page('tab_remotes')
+        remotes = list(getattr(CFG, 'remotes', None) or [])
+        if not remotes:
+            lbl_none = Gtk.Label(label=tr('rm_none_configured'))
+            lbl_none.set_halign(Gtk.Align.START)
+            gr.attach(lbl_none, 0, 0, 6, 1)
+        else:
+            for col, key in enumerate(('rm_col_name', 'rm_col_url', 'rm_col_health')):
+                head = Gtk.Label()
+                head.set_markup(f'<b>{GLib.markup_escape_text(tr(key))}</b>')
+                head.set_halign(Gtk.Align.START)
+                gr.attach(head, col * 2, 0, 2, 1)
+            # URL RÉDIGÉE et santé calculées par remotes_panel_rows (partagé avec
+            # la TUI) : le dialogue ne fait plus que poser des Gtk.Label.
+            panel = remotes_panel_rows(remotes, remote_stat, remote_poll_s, time.monotonic())
+            for i, (r, cells) in enumerate(zip(remotes, panel, strict=True), start=1):
+                for col, text in enumerate(cells):
+                    lbl = Gtk.Label(label=text)
+                    lbl.set_halign(Gtk.Align.START)
+                    lbl.set_ellipsize(Pango.EllipsizeMode.MIDDLE)
+                    lbl.set_max_width_chars(34)
+                    lbl.set_tooltip_text(text)
+                    lbl.set_sensitive(r.get('enabled', True))
+                    gr.attach(lbl, col * 2, i, 2, 1)
+        hint = Gtk.Label(label=tr('rm_readonly_hint'))
+        hint.set_halign(Gtk.Align.START)
+        hint.set_line_wrap(True)
+        hint.set_max_width_chars(64)
+        hint.set_margin_top(12)
+        gr.attach(hint, 0, len(remotes) + 2, 6, 1)
+
         # Live preview — connecté après les set_active_id/set_value initiaux
-        for widget, signal in [
+        for widget, signal_name in [
             (self._lang_combo,    'changed'),
             (self._screen_combo,  'changed'),
             (self._corner_combo,  'changed'),
@@ -1997,7 +3033,7 @@ class SettingsDialog(Gtk.Dialog):
             (self._combo_sort,      'changed'),
             (self._combo_idle,      'changed'),
         ]:
-            widget.connect(signal, self._on_preview_change)
+            widget.connect(signal_name, self._on_preview_change)
 
         content.show_all()
 
@@ -2043,6 +3079,44 @@ class SettingsDialog(Gtk.Dialog):
         }
 
 
+def _never_dies(keep: bool):
+    """Garde des callbacks PÉRIODIQUES branchés sur GLib.timeout_add.
+
+    Portée réelle, dite franchement plutôt que promise trop large : les cinq
+    sources récurrentes, celles dont la perte est définitive et silencieuse. Les
+    callbacks ONE-SHOT (idle_add, timeout_add non réarmé) ne sont pas décorés —
+    une exception y coûte une action manquée, pas une source morte pour la durée
+    du processus. Le test de garde énumère les cinq ; s'il en manquait un, c'est
+    lui qui le dirait, pas ce commentaire.
+
+    GLib RETIRE DÉFINITIVEMENT une source dont le callback lève (mesuré sur une
+    vraie boucle GTK3 : la fonction tourne UNE fois, puis plus jamais). Une seule
+    ligne fautive — par exemple `row.session['waiting']` sur une ligne dérivée
+    d'un remote au payload inattendu — et l'animation, la vérification de
+    version ou l'enregistrement de position s'arrêtent pour toute la session,
+    avec la trace sur un stderr qu'un lancement depuis le bureau n'a pas.
+
+    UNE seule implémentation appliquée aux cinq sites, plutôt qu'un try/except
+    recopié à la main à chacun : c'est justement la copie manquante qui a fait
+    le trou — seul _refresh était gardé, ses quatre voisins ne l'étaient pas.
+
+    `keep` porte la convention de retour de la source EN CAS D'ERREUR, et il n'y
+    a pas de défaut sûr : True ré-arme une source périodique (ce qu'on veut),
+    mais ré-armerait aussi un one-shot, soit une boucle sans fin. D'où le
+    paramètre obligatoire, tranché site par site.
+    """
+    def decorate(fn):
+        @functools.wraps(fn)
+        def guarded(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception:
+                traceback.print_exc()
+                return keep
+        return guarded
+    return decorate
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class ClaudeWatcher(Gtk.Window):
@@ -2050,15 +3124,39 @@ class ClaudeWatcher(Gtk.Window):
     def __init__(self, cfg: argparse.Namespace):
         # Layer shell nécessite TOPLEVEL ; POPUP pour X11 (no-decoration natif).
         super().__init__(type=Gtk.WindowType.TOPLEVEL if IS_WAYLAND else Gtk.WindowType.POPUP)
-        self.sessions      = []
-        self._session_rows = []   # SessionRow ordonnées (nav clavier + anim)
-        self._last_size    = None # dernière taille (w, h) appliquée — anti-churn resize
-        self._last_rows_sig = None # structure des lignes (cols, pids) au dernier rebuild
+        self.sessions: list[dict] = []
+        self._session_rows: list[Any] = []   # SessionRow ordonnées (nav clavier + anim)
+        # dernière taille (w, h) appliquée — anti-churn resize
+        self._last_size: tuple[int, int] | None = None
+        # structure des lignes (colonnes, clés ordonnées) au dernier rebuild
+        self._last_rows_sig: tuple[int, tuple[str, ...]] | None = None
         self._anim_tick    = 0
         self._snooze_until = 0
         self._snooze_timer = None
         self._kb_index        = -1
         self._kb_bind_retries = 0
+
+        # Machines distantes. Aucun remote déclaré → aucun poller, aucun thread,
+        # aucun HTTP : comportement d'avant, à l'octet près.
+        # enabled_remotes ici : le poller ne refiltre plus (le filtre vit à un
+        # seul endroit), donc lui passer la liste complète ferait interroger un
+        # remote explicitement désactivé. La liste COMPLÈTE reste sur CFG pour
+        # l'onglet de paramètres, qui doit montrer les éteints.
+        remotes = enabled_remotes(getattr(cfg, 'remotes', None) or [])
+        self._remote_stat: dict[str, dict] = {}
+        # Protège _remote_pending : la marque est posée depuis les threads de
+        # poll (cf. _notify_remote_update), un check-then-set nu y est une course.
+        self._lock = threading.Lock()
+        self._remote_pending = False
+        # Drapeau MONOTONE de destruction (posé par le signal `destroy`, jamais
+        # remis à False). Gtk.Widget.in_destruction() ne répond True que PENDANT
+        # dispose (mesuré : True au cours du destroy, False après) : une source
+        # idle planifiée avant la destruction et servie après passait donc le
+        # garde et touchait des widgets morts. Ce drapeau, lui, ne rajeunit pas.
+        self._destroyed = False
+        self._poller = RemotePoller(
+            remotes, getattr(cfg, 'remote_poll_ms', REMOTE_POLL_MS),
+            notify=self._notify_remote_update) if remotes else None
 
         self.screen   = cfg.screen
         self.corner   = cfg.corner
@@ -2074,7 +3172,7 @@ class ClaudeWatcher(Gtk.Window):
         # Sur Wayland, la position est gérée par gtk-layer-shell (anchor + margin).
         if not IS_WAYLAND and cfg.x is not None and cfg.y is not None:
             g = self._get_monitor_geom()
-            self._user_pos = (g.x + cfg.x, g.y + cfg.y)
+            self._user_pos: tuple[int, int] | None = (g.x + cfg.x, g.y + cfg.y)
             self._save_position()
         elif not IS_WAYLAND and cfg.mode == 'free':
             # Mode libre explicite — charger la position sauvegardée.
@@ -2083,8 +3181,8 @@ class ClaudeWatcher(Gtk.Window):
             # Mode ancré (corner) ou Wayland — ignorer position.json.
             self._user_pos = None
 
-        self._tray      = None
-        self._tray_menu = None
+        self._tray: Any = None
+        self._tray_menu: Any = None
         self._hidden    = False
         if cfg.tray:
             self._init_tray()
@@ -2217,6 +3315,23 @@ class ClaudeWatcher(Gtk.Window):
         self._render_version_label()
         footer.pack_end(ver_evt, False, False, 0)
 
+        # Zone d'état des remotes (pied de fenêtre) : TOUS les remotes configurés
+        # y figurent, même sans session. Un remote qui n'a JAMAIS répondu (URL
+        # fausse, token invalide, hôte éteint au démarrage) n'a aucune ligne à
+        # marquer périmée — sans cette zone il serait purement invisible.
+        self.lbl_remotes = Gtk.Label()
+        self.lbl_remotes.set_halign(Gtk.Align.START)
+        # Enroulé, PAS ellipsé : la zone doit montrer TOUS les remotes (c'est sa
+        # raison d'être) — un ellipsage cacherait justement le remote muet qu'on
+        # veut voir. Elle passe donc à la ligne au lieu de couper.
+        self.lbl_remotes.set_line_wrap(True)
+        self.lbl_remotes.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        # Borne la largeur NATURELLE : en mode auto_width, une liste de remotes
+        # bavarde élargirait la fenêtre hors écran (même piège que lbl_counts).
+        self.lbl_remotes.set_max_width_chars(40)
+        self.lbl_remotes.set_no_show_all(True)   # rien à afficher sans remote
+        footer.pack_start(self.lbl_remotes, True, True, 0)
+
         # Footer draggable too — same handler as header (widget-agnostic).
         footer_evt = Gtk.EventBox()
         footer_evt.set_visible_window(False)  # let the toplevel custom bg paint through
@@ -2246,6 +3361,13 @@ class ClaudeWatcher(Gtk.Window):
         self.connect('button-press-event',   self._on_window_press)
         self.connect('scroll-event',         self._on_scroll)
         self._setup_status_monitor()
+        if self._poller:
+            self._poller.start()
+        # Les threads sont daemon (ils ne retiendraient pas le process), mais on
+        # les arrête proprement avec la fenêtre : sans ça un poll en cours lui
+        # survit jusqu'à son timeout.
+        self.connect('destroy', self._stop_poller)
+        self.connect('destroy', self._mark_destroyed)
         self._refresh()
         self._refresh_timer_id = GLib.timeout_add(cfg.refresh_ms, self._refresh)
         GLib.timeout_add(600, self._tick_anim)
@@ -2257,6 +3379,7 @@ class ClaudeWatcher(Gtk.Window):
     def _is_snoozed(self) -> bool:
         return time.time() < self._snooze_until
 
+    @_never_dies(keep=False)
     def _snooze_wakeup(self):
         self._snooze_until = 0
         self._snooze_timer = None
@@ -2373,6 +3496,7 @@ class ClaudeWatcher(Gtk.Window):
             GLib.idle_add(self._apply_version_check, latest)
         threading.Thread(target=worker, daemon=True).start()
 
+    @_never_dies(keep=True)
     def _recheck_version_tick(self):
         self._check_latest_version_async()
         return True  # keep the periodic timer alive
@@ -2400,6 +3524,10 @@ class ClaudeWatcher(Gtk.Window):
                 w.hide()
             else:
                 w.show_all()
+        if not rolled:
+            # show_all() ne réaffiche PAS lbl_remotes (no_show_all) : sans ça la
+            # zone d'état reste vide jusqu'au prochain tick après un déroulement.
+            self._update_remotes_bar()
         # Rolled: compact pill — drop the header/footer padding so the window
         # shrinks to the title's natural size. _apply_window_size gère la
         # bascule des contraintes de taille (pilule ↔ largeur fixe + hauteur).
@@ -2587,7 +3715,7 @@ class ClaudeWatcher(Gtk.Window):
         # Kept as attributes so _update_tray_menu_labels() can retitle in place
         self._mi_show = mi_show = Gtk.MenuItem(label=tr('show') if self._hidden else tr('hide'))
         mi_show.connect('activate', lambda _m: self._toggle_visibility())
-        snooze_label = tr('snooze_wake') if self._is_snoozed() else f"{tr('snooze_hide')} {CFG.snooze_sec // 60}m"
+        snooze_label = tr('snooze_wake') if self._is_snoozed() else f"{tr('snooze_hide')} {CFG.snooze_sec // 60}m"  # noqa: E501 (ligne préexistante, cf. pyproject.toml)
         self._mi_snooze = mi_snooze = Gtk.MenuItem(label=snooze_label)
         mi_snooze.connect('activate', lambda _m: self._toggle_snooze())
         self._mi_about = mi_about = Gtk.MenuItem(label=tr('about'))
@@ -2596,7 +3724,7 @@ class ClaudeWatcher(Gtk.Window):
         mi_quit.connect('activate', lambda _m: Gtk.main_quit())
         self._mi_settings = mi_settings = Gtk.MenuItem(label=tr('settings_menu'))
         mi_settings.connect('activate', lambda _m: self._open_settings())
-        for mi in (mi_show, mi_snooze, Gtk.SeparatorMenuItem(), mi_settings, Gtk.SeparatorMenuItem(), mi_about, Gtk.SeparatorMenuItem(), mi_quit):
+        for mi in (mi_show, mi_snooze, Gtk.SeparatorMenuItem(), mi_settings, Gtk.SeparatorMenuItem(), mi_about, Gtk.SeparatorMenuItem(), mi_quit):  # noqa: E501 (ligne préexistante, cf. pyproject.toml)
             menu.append(mi)
         menu.show_all()
         return menu
@@ -2756,7 +3884,10 @@ class ClaudeWatcher(Gtk.Window):
         return box
 
     def _open_settings(self):
-        dlg = SettingsDialog(self)
+        dlg = SettingsDialog(
+            self,
+            remote_stat=self._poller.snapshot() if self._poller else {},
+            remote_poll_s=self._poller.poll_s if self._poller else REMOTE_POLL_MS / 1000)
         response = dlg.run()
         if response == Gtk.ResponseType.OK:
             values = dlg.get_values()
@@ -2815,38 +3946,35 @@ class ClaudeWatcher(Gtk.Window):
         self._refresh()
 
     def _apply_settings(self, values: dict):
-        """Écrit config.ini et applique tous les paramètres."""
-        cfg_file = configparser.ConfigParser()
-        cfg_file.read(CONFIG_PATH)
-        for section in ('general', 'display', 'features'):
-            if section not in cfg_file:
-                cfg_file[section] = {}
-        cfg_file['general']['lang']       = values['lang']
-        cfg_file['general']['hotkey']     = values['hotkey']
-        cfg_file['features']['shortcut_enable'] = 'true' if values['shortcut_enable'] else 'false'
-        cfg_file['features']['show_topic'] = 'true' if values['show_topic'] else 'false'
-        cfg_file['features']['show_agents'] = 'true' if values['show_agents'] else 'false'
-        cfg_file['features']['hide_daemons'] = 'true' if values['hide_daemons'] else 'false'
-        cfg_file['display']['mode']       = 'free' if values['free'] else 'corner'
-        cfg_file['display']['screen']     = str(values['screen'])
-        cfg_file['display']['corner']     = values['corner']
-        cfg_file['display']['margin_x']   = str(values['margin_x'])
-        cfg_file['display']['margin_y']   = str(values['margin_y'])
-        cfg_file['display']['width']      = str(values['width'])
-        cfg_file['display']['auto_width'] = 'true' if values['auto_width'] else 'false'
-        cfg_file['display']['columns']    = str(values['columns'])
-        cfg_file['display']['max_height'] = str(values['max_height'])
-        cfg_file['display']['sort_mode']  = values['sort_mode']
-        cfg_file['display']['idle_format'] = values['idle_format']
-        cfg_file['display']['refresh_ms'] = str(values['refresh_ms'])
-        cfg_file['display']['snooze_sec'] = str(values['snooze_sec'])
-        cfg_file['display']['bg_alpha']   = str(values['bg_alpha'])
-        try:
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with CONFIG_PATH.open('w') as f:
-                cfg_file.write(f)
-        except OSError:
-            pass
+        """Écrit config.ini (via save_config, qui force 0600) et applique tout."""
+        save_config({
+            'general': {
+                'lang':   values['lang'],
+                'hotkey': values['hotkey'],
+            },
+            'features': {
+                'shortcut_enable': 'true' if values['shortcut_enable'] else 'false',
+                'show_topic':      'true' if values['show_topic'] else 'false',
+                'show_agents':     'true' if values['show_agents'] else 'false',
+                'hide_daemons':    'true' if values['hide_daemons'] else 'false',
+            },
+            'display': {
+                'mode':        'free' if values['free'] else 'corner',
+                'screen':      str(values['screen']),
+                'corner':      values['corner'],
+                'margin_x':    str(values['margin_x']),
+                'margin_y':    str(values['margin_y']),
+                'width':       str(values['width']),
+                'auto_width':  'true' if values['auto_width'] else 'false',
+                'columns':     str(values['columns']),
+                'max_height':  str(values['max_height']),
+                'sort_mode':   values['sort_mode'],
+                'idle_format': values['idle_format'],
+                'refresh_ms':  str(values['refresh_ms']),
+                'snooze_sec':  str(values['snooze_sec']),
+                'bg_alpha':    str(values['bg_alpha']),
+            },
+        })
 
         new_refresh = values['refresh_ms']
         if new_refresh != CFG.refresh_ms:
@@ -3235,6 +4363,7 @@ class ClaudeWatcher(Gtk.Window):
             GLib.source_remove(self._save_timer)
         self._save_timer = GLib.timeout_add(400, self._save_position_tick)
 
+    @_never_dies(keep=False)
     def _save_position_tick(self):
         self._save_timer = 0
         self._save_position()
@@ -3297,21 +4426,109 @@ class ClaudeWatcher(Gtk.Window):
         self._status_monitors[key] = mon
 
     def _sync_status_monitors(self) -> None:
-        """Surveille le sessions/ de chaque CLAUDE_CONFIG_DIR exposé par le scan."""
-        for s in self.sessions:
-            cfg = s.get('config_dir')
-            if cfg:
-                self._watch_status_dir(Path(cfg) / 'sessions')
+        """Surveille le sessions/ de chaque CLAUDE_CONFIG_DIR exposé par le scan.
+
+        Les lignes DISTANTES sont exclues (cf. local_config_dirs).
+        """
+        for cfg in local_config_dirs(self.sessions):
+            self._watch_status_dir(Path(cfg) / 'sessions')
 
     def _on_status_changed(self, _monitor, gfile, _other, event_type):
         if event_type in (Gio.FileMonitorEvent.CHANGED, Gio.FileMonitorEvent.CREATED):
             if gfile.get_basename().endswith('.json'):
                 self._refresh()
 
+    def _stop_poller(self, *_):
+        if self._poller:
+            self._poller.stop()
+
+    def _mark_destroyed(self, *_):
+        """Pose le drapeau monotone lu par _remote_update_tick (cf. __init__)."""
+        self._destroyed = True
+
+    def _notify_remote_update(self):
+        """Appelé DEPUIS un thread de poll : ne touche à aucun widget, replanifie
+        juste un rafraîchissement dans la boucle GTK (idle_add est la seule
+        primitive GLib sûre depuis un autre thread).
+
+        Coalescé : trois remotes qui répondent en même temps ne déclenchent qu'un
+        seul scan local. La marque est posée SOUS LE VERROU : en lecture-puis-
+        écriture non protégée, deux threads pouvaient la lire False en même temps
+        et planifier deux idle — la coalescence promise par cette docstring
+        n'était alors qu'un vœu.
+        """
+        with self._lock:
+            if self._remote_pending:
+                return
+            self._remote_pending = True
+        GLib.idle_add(self._remote_update_tick)
+
+    def _remote_update_tick(self):
+        with self._lock:          # même verrou que la pose : une seule vérité
+            self._remote_pending = False
+        # La fenêtre peut avoir été détruite entre le GLib.idle_add (fait depuis
+        # un thread de poll) et l'exécution de cette source : _notify_remote_update
+        # relit `_stop`, mais rien n'empêche l'arrêt de tomber juste après. Un
+        # _refresh() sur une fenêtre détruite touche des widgets morts.
+        #
+        # PAS in_destruction() : ce prédicat n'est vrai que PENDANT dispose
+        # (mesuré — True au cours du destroy, False après), donc il laissait
+        # passer précisément le cas visé, une idle planifiée avant la destruction
+        # et servie après. Le drapeau posé par le signal `destroy` est monotone.
+        if self._destroyed:
+            return False
+        self._refresh()
+        return False   # source idle à usage unique
+
+    def _empty_state_text(self) -> str:
+        return empty_state_text(self._poller.remotes if self._poller else [],
+                                self._remote_stat)
+
+    def _update_remotes_bar(self):
+        """Zone d'état du pied de fenêtre. Masquée tant qu'aucun remote n'est
+        configuré (widget invisible, zéro pixel pris)."""
+        self.lbl_remotes.set_visible(bool(self._poller))
+        if not self._poller:
+            return
+        remotes = self._poller.remotes
+        bar = remotes_bar_text(remotes, self._remote_stat, self._poller.poll_s,
+                               time.monotonic())
+        self.lbl_remotes.set_markup(
+            f'<span foreground="{COLOR_REMOTE}" font="Monospace 8">'
+            f'{GLib.markup_escape_text(bar)}</span>'
+        )
+        self.lbl_remotes.set_tooltip_text(remotes_bar_tooltip(remotes, self._remote_stat))
+
+    def _rstate_for(self, s: dict) -> dict | None:
+        """État du remote d'une ligne (cf. remote_rstate). L'horloge est MONOTONE :
+        la péremption ne doit pas pouvoir rajeunir sur un pas NTP arrière."""
+        if not self._poller:
+            return None
+        return remote_rstate(s, self._remote_stat, self._poller.poll_s, time.monotonic())
+
+    @_never_dies(keep=True)
     def _refresh(self):
-        self.sessions = scan_sessions()
-        self._sync_status_monitors()
-        self._rebuild_sessions()
+        """Deux garde-fous, deux portées — ils ne font pas le même travail.
+
+        Le décorateur empêche la SOURCE de mourir (cf. _never_dies). Le try
+        interne, lui, borne la casse d'un tick : une seule ligne fautive ne doit
+        coûter que le contenu de ce tour, on préfère une image figée à un widget
+        mort pour la session.
+
+        Lecture du cache du poller uniquement : AUCUN HTTP ici (on tourne dans la
+        boucle GTK, un hôte lent figerait la fenêtre).
+        """
+        try:
+            remote_rows = self._poller.sessions() if self._poller else None
+            self._remote_stat = self._poller.snapshot() if self._poller else {}
+            self.sessions = scan_sessions(remote_rows)
+            self._sync_status_monitors()
+            self._rebuild_sessions()
+        except Exception:
+            traceback.print_exc()
+        # HORS du try : le repositionnement ne dépend pas des lignes. Dedans, un
+        # défaut de ligne passager le sautait aussi et laissait la fenêtre mal
+        # dimensionnée jusqu'au prochain tick propre — deux pannes pour une.
         GLib.idle_add(self._reposition)
         return True
 
@@ -3338,6 +4555,7 @@ class ClaudeWatcher(Gtk.Window):
         self.lbl_counts.set_markup(
             f'<span font="Monospace 8">{" · ".join(parts)}</span>'
         )
+        self._update_remotes_bar()
 
         cols = self._effective_cols()
         # Signature de structure : si colonnes + liste ordonnée des pids sont
@@ -3347,12 +4565,15 @@ class ClaudeWatcher(Gtk.Window):
         # clignote et l'anim repart. Le destroy/recreate (qui libère les GdkWindow,
         # cf. fuite RSS ~20 Mo/min avec un simple remove) n'a lieu que sur un vrai
         # changement de structure : ajout/retrait/réordre de session, ou colonnes.
-        sig = (cols, tuple(s['pid'] for s in self.sessions))
+        # session_key (et pas le pid nu) : un pid 1234 local et un pid 1234
+        # distant sont deux process différents, la signature les confondrait et
+        # une ligne serait mise à jour avec les données de l'autre.
+        sig = (cols, tuple(session_key(s) for s in self.sessions))
         if (sig == self._last_rows_sig
                 and self.sessions
                 and len(self._session_rows) == len(self.sessions)):
-            for row, s in zip(self._session_rows, self.sessions):
-                row.update_session(s)
+            for row, s in zip(self._session_rows, self.sessions, strict=True):
+                row.update_session(s, self._rstate_for(s))
         else:
             self._last_rows_sig = sig
             for child in self.sessions_box.get_children():
@@ -3365,7 +4586,7 @@ class ClaudeWatcher(Gtk.Window):
                 lbl = Gtk.Label()
                 lbl.set_markup(
                     f'<span foreground="{TEXT_DIM}" font="Monospace 8">'
-                    f'  {tr("no_session")}</span>'
+                    f'  {GLib.markup_escape_text(self._empty_state_text())}</span>'
                 )
                 lbl.set_halign(Gtk.Align.START)
                 lbl.set_margin_top(8)
@@ -3377,7 +4598,7 @@ class ClaudeWatcher(Gtk.Window):
                 # i%cols, rangée i//cols. hexpand pour que chaque colonne occupe sa
                 # part égale de la largeur (grille homogène).
                 for i, s in enumerate(self.sessions):
-                    row = SessionRow(s)
+                    row = SessionRow(s, self._rstate_for(s))
                     row.set_hexpand(True)
                     self._session_rows.append(row)
                     self.sessions_box.attach(row, i % cols, i // cols, 1, 1)
@@ -3398,6 +4619,7 @@ class ClaudeWatcher(Gtk.Window):
             else:
                 self._kb_deactivate()
 
+    @_never_dies(keep=True)
     def _tick_anim(self):
         self._anim_tick = (self._anim_tick + 1) % 6
         for row in self._session_rows:
@@ -3415,6 +4637,13 @@ def dump_round():
     Pour troubleshooter le classement working/waiting : montre les valeurs
     intermédiaires (statut registre brut, état JSONL brut) à côté de l'état
     final réconcilié — exactement ce que calcule `get_session_state`.
+
+    Volontairement LOCAL : ces valeurs intermédiaires n'existent que dans /proc
+    et les JSONL de CETTE machine, une ligne distante n'en expose aucune. C'est
+    pourquoi main() REFUSE --dump avec --no-local ou avec un remote ACTIF, quelle
+    que soit sa provenance — drapeau --remote ou section [remote:<nom>] du
+    config.ini — au lieu de les ignorer en silence, ce qu'il faisait : un
+    scan_proc() direct rend ces déclarations sans effet.
     """
     procs, subagents = scan_proc()
     if not procs:
@@ -3444,14 +4673,14 @@ def dump_round():
         wt_root, wt_name = split_worktree(eff_cwd)
         confirmed_wt = wt_name is not None and last_activity is not None
         reg_mapped = _STATUS_MAP.get(reg_status or '', 'idle') if reg else '(no registry)'
-        print(f"pid {pid}  {project_label(wt_root if confirmed_wt else eff_cwd)}  ({format_elapsed(p['elapsed'])})")
+        print(f"pid {pid}  {project_label(wt_root if confirmed_wt else eff_cwd)}  ({format_elapsed(p['elapsed'])})")  # noqa: E501 (ligne préexistante, cf. pyproject.toml)
         print(f"  cwd          {eff_cwd or '?'}")
-        print(f"  worktree     {wt_name if confirmed_wt else ('(detected, unconfirmed)' if wt_name else '(none)')}")
+        print(f"  worktree     {wt_name if confirmed_wt else ('(detected, unconfirmed)' if wt_name else '(none)')}")  # noqa: E501 (ligne préexistante, cf. pyproject.toml)
         print(f"  config_dir   {display_config_dir(config_dir) or '(default)'}")
         print(f"  session_id   {session_id or '(none)'}")
         print(f"  reg.status   {reg_status!r} -> {reg_mapped}")
         print(f"  jsonl_state  {jsonl_state!r}")
-        print(f"  => state     {state}{'  (reconciled from registry)' if reg and reg_mapped != state else ''}")
+        print(f"  => state     {state}{'  (reconciled from registry)' if reg and reg_mapped != state else ''}")  # noqa: E501 (ligne préexistante, cf. pyproject.toml)
         print(f"  context_pct  {ctx}")
         print(f"  tool         {tool}")
         print(f"  topic        {topic}")
@@ -3477,7 +4706,33 @@ def list_screens():
 def main():
     global CFG
     signal.signal(signal.SIGINT, signal.SIG_DFL)
-    CFG = parse_args(load_config())
+    conf = load_config()
+    CFG = parse_args(conf)
+    # Remotes : sections du config.ini + drapeaux --remote (les drapeaux gagnent,
+    # rien n'est persisté). Liste vide = comportement d'avant, à l'octet près.
+    CFG.remote_poll_ms = conf['remote_poll_ms']
+    try:
+        CFG.remotes = resolve_remotes(conf['remote_sections'], CFG.remote)
+    except ValueError as e:
+        # `enabled` ininterprétable, ou deux noms de remote sur la même variable
+        # d'environnement de token : on refuse de démarrer PLUTÔT que d'envoyer
+        # le token quelque part par défaut. Message, pas traceback.
+        raise SystemExit(f"claude-watcher: {e}") from None
+    # --dump est un diagnostic PUREMENT LOCAL : il montre les valeurs
+    # intermédiaires (registre vs JSONL) que seul /proc fournit, et une machine
+    # distante n'en expose aucune. On refuse la combinaison plutôt que de laisser
+    # croire qu'elle a été prise en compte.
+    #
+    # ICI et pas dans parse_args : c'est le seul point où les DEUX sources de
+    # remotes sont visibles. parse_args ne connaît que le drapeau --remote, donc
+    # un remote déclaré en section [remote:*] du config.ini passait le contrôle
+    # et dump_round() l'ignorait sans un mot. La liste est filtrée sur `enabled`
+    # — un remote explicitement désactivé n'est pas interrogé, donc ne pas le
+    # rendre n'est pas un mensonge.
+    if CFG.dump and (CFG.no_local or enabled_remotes(CFG.remotes)):
+        raise SystemExit('claude-watcher: --dump est un diagnostic local : '
+                         'incompatible avec --no-local et avec toute machine distante '
+                         '(--remote, ou une section [remote:<nom>] du config.ini).')
     if CFG.dump:
         dump_round()
         return
