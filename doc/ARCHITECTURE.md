@@ -125,14 +125,25 @@ the raw label untouched.
    - `idle` → **idle**
    - `procStart` in the file must match the process `starttime` — a stale file
      from a recycled PID is ignored.
-   - a `shell` or `busy` status can stick after the turn actually ended (a
-     background shell outliving the turn, or interrupted subagents that never
-     flip the status back). When the transcript shows the turn finished
-     (`waiting`/`idle`), that status is reconciled down to **background** — a
-     low-priority state (`waiting` > `working` > `background` > `idle`) meaning
-     work may still run in the background while Claude itself is no longer
-     computing. `compacting` is not reconciled — it is genuine, brief
+   - a `shell` or `busy` status can stick after the turn actually ended, and the
+     two do not mean the same thing. When the transcript shows the turn finished
+     (`waiting`/`idle`): `shell` becomes **background** — a background shell
+     (`!cmd`, `run_in_background`, a Monitor) really is still running, so a
+     low-priority state (`waiting` > `working` > `background` > `idle`) flags it
+     without stealing the show from an active session; `busy` takes the
+     transcript state instead — nothing is running, the status merely stuck
+     (interrupted subagents, or a session the user backgrounded, after which the
+     registry stops being updated), and calling it **background** announced work
+     that does not exist. `compacting` is not reconciled — it is genuine, brief
      background work.
+   - only turn-END system events (`turn_duration`, `stop_hook_summary`,
+     `away_summary`) prove the turn is over. Mid-turn ones (`informational`,
+     `api_error`, `local_command`, `compact_boundary`, …) are skipped: reading
+     them as an ended turn reconciled a working session down to background.
+   - the transcript is located by `sessionId`; a session resumed from another
+     directory (`claude -r`) keeps its JSONL under its ORIGINAL project, so it is
+     also looked up across projects. There is no "latest .jsonl of the project"
+     fallback when the id is known — that read a NEIGHBOUR session's state.
    Not every Claude Code version writes this file; when it is absent the widget
    uses the transcript fallback below.
 3. **State (transcript fallback)** — used when no registry file is present.
@@ -141,7 +152,9 @@ the raw label untouched.
      / still-streaming (`null`) → **working**; a terminal reason (`end_turn`,
      `max_tokens`, `stop_sequence`, `refusal`) → **waiting**.
    - `user` → **working**
-   - `system` → **idle**
+   - `system` → **idle**, but ONLY for a turn-END subtype (`turn_duration`,
+     `stop_hook_summary`, `away_summary`). Any other subtype happens mid-turn
+     and is skipped, so the scan keeps walking back to the real last event.
    This is coarser than the registry: it cannot tell a tool that is *executing*
    (working) from one *awaiting permission approval* (which also ends in an
    `assistant` `tool_use` and genuinely needs the user) — both read as
