@@ -86,7 +86,8 @@ SHARED_DETECTION_CONSTANTS = [
 ]
 
 SHARED_DETECTION_SYMBOLS = [
-    '_argv_value', 'scan_proc', 'get_cwd', 'get_env', 'split_worktree', 'cwd_to_project_dir',
+    '_argv_value', 'scan_proc', 'get_cwd', 'get_env', 'split_worktree', 'git_worktree',
+    'worktree_of', 'cwd_to_project_dir',
     'context_window_for', '_read_tail_lines', '_read_topic', '_parse_session_lines',
     '_find_transcript',
     'get_session_info_from_jsonl', 'get_session_registry', 'get_session_state',

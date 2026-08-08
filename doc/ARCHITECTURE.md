@@ -114,6 +114,15 @@ and idle time work), labels the row with the real project name, and adds a
 `↳ WT: <name>` sub-line. When the parent transcript can't be confirmed it leaves
 the raw label untouched.
 
+A **plain git worktree** (`git worktree add`, checkout anywhere) carries no
+marker in its path, so it is detected on disk instead: its root holds a `.git`
+FILE pointing at `<repo>/.git/worktrees/<name>`. That file is the proof — no
+transcript confirmation needed — and the row gets the same treatment (repository
+name as label, `↳ WT: <name>` sub-line). Display only: unlike a Claude worktree,
+its transcript lives under its OWN cwd slug, so transcript resolution is
+untouched. A `.git` directory (ordinary checkout) or a `gitdir:` pointing at
+`.git/modules/<name>` (submodule) is not a worktree.
+
 1. A single `/proc` pass enumerates both sessions and subagents. Sessions are
    `/proc/<pid>/comm` exact-matching `claude`; field 22 of `/proc/<pid>/stat`
    gives the process `starttime` (in ticks). The same pass also collects

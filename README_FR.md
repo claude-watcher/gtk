@@ -16,6 +16,7 @@ Un widget de bureau GTK3 pour Ubuntu qui surveille toutes les sessions Claude Co
   - **Travaille** (amber) — Claude traite votre message, avec le nom de l'outil
   - **Idle** (vert) — session en pause
 - Utilisation de la fenêtre de contexte (`ctx%`) affichée si disponible
+- Sessions en **worktree** Git rattachées à leur vrai projet, étiquetées `↳ WT: <nom>`
 - Nombre de sous-agents lancés par session (`N agents`), chacun détaillé dans l'infobulle de la ligne — désactivable dans les réglages
 - Démon de fond affiché en ligne `(D)` non-focusable (masquable dans les réglages)
 - Clic sur une session pour focus le terminal correspondant
