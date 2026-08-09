@@ -134,17 +134,15 @@ untouched. A `.git` directory (ordinary checkout) or a `gitdir:` pointing at
    - `idle` → **idle**
    - `procStart` in the file must match the process `starttime` — a stale file
      from a recycled PID is ignored.
-   - a `shell` or `busy` status can stick after the turn actually ended, and the
-     two do not mean the same thing. When the transcript shows the turn finished
-     (`waiting`/`idle`): `shell` becomes **background** — a background shell
-     (`!cmd`, `run_in_background`, a Monitor) really is still running, so a
-     low-priority state (`waiting` > `working` > `background` > `idle`) flags it
-     without stealing the show from an active session; `busy` takes the
-     transcript state instead — nothing is running, the status merely stuck
-     (interrupted subagents, or a session the user backgrounded, after which the
-     registry stops being updated), and calling it **background** announced work
-     that does not exist. `compacting` is not reconciled — it is genuine, brief
-     background work.
+   - a `shell` or `busy` status can stick after the turn actually ended. When the
+     transcript shows the turn finished (`waiting`/`idle`), that status no longer
+     describes reality and the transcript state is taken. `shell` additionally
+     raises the `bg_shell` flag: a background shell (`!cmd`, `run_in_background`,
+     a Monitor) really is still running — but that is a detail ABOUT the session,
+     rendered as a `⚙ sh` marker beside the state badge, never as a state of its
+     own. It does not affect ordering, the tray colour, or the idle duration:
+     Claude handed control back, the session IS idle. `compacting` is not
+     reconciled — it is genuine, brief foreground work.
    - only turn-END system events (`turn_duration`, `stop_hook_summary`,
      `away_summary`) prove the turn is over. Mid-turn ones (`informational`,
      `api_error`, `local_command`, `compact_boundary`, …) are skipped: reading

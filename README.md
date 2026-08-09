@@ -15,6 +15,8 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
   - **Waiting** (orange) — Claude replied, waiting for your input
   - **Working** (amber) — Claude is processing your message, with tool name
   - **Idle** (green) — session paused
+- A `⚙ sh` marker beside the badge when a background shell outlived the turn
+  (`!cmd`, a backgrounded Bash, a Monitor) — Claude is available, something still runs
 - Context window usage (`ctx%`) shown when available
 - Git **worktree** sessions resolved to their real project, tagged `↳ WT: <name>`
 - Spawned subagent count per session (`N agents`), with each agent detailed in the row tooltip — toggle off in settings

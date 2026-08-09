@@ -40,7 +40,7 @@ SHARED_CONSTANTS = [
     'REMOTE_POLL_MS', 'REMOTE_POLL_MIN_MS', 'REMOTE_TIMEOUT_S', 'REMOTE_READ_BUDGET_S',
     'REMOTE_READ_CHUNK', 'REMOTE_MAX_BYTES', 'REMOTE_MAX_ROWS', 'REMOTE_MAX_ELAPSED_S',
     'REMOTE_STALE_X', 'REMOTE_LABEL_MAX', 'REMOTE_BACKOFF_MAX_S', 'REMOTE_AUTH_RETRY_S',
-    'REMOTE_SCHEMES', 'COLOR_REMOTE', '_BOOL_TRUE', '_BOOL_FALSE', '_ANSI_RE', '_CTRL_RE',
+    'REMOTE_SCHEMES', 'COLOR_REMOTE', 'BG_SHELL_GLYPH', '_BOOL_TRUE', '_BOOL_FALSE', '_ANSI_RE', '_CTRL_RE',
 ]
 
 SHARED_SYMBOLS = [
@@ -64,6 +64,10 @@ SHARED_SYMBOLS = [
     # (Le contenu de STRINGS lui-même est comparé par le test dédié plus bas :
     #  les deux clients n'ont pas les mêmes écrans, donc pas les mêmes clés.)
     'format_elapsed', 'tr',
+    # Compteurs de l'en-tête : rédaction ET repli de largeur portés des deux
+    # côtés (cf. specs/002) — une abréviation qui diverge, et les deux clients
+    # ne disent plus la même chose de la même flotte.
+    'counts_segments', 'counts_sep', 'fit_level',
 ]
 
 # Socle de DÉTECTION — porté à l'identique lui aussi, et jusqu'ici couvert par

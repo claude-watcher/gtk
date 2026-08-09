@@ -31,7 +31,8 @@ def _instance(tmp_path, registry_cwd: str | None = REG_CWD):
     # Claude slugifie le cwd (chaque non-alphanumérique → '-') : /tmp/proj → -tmp-proj.
     proj = tmp_path / 'projects' / '-tmp-proj'
     proj.mkdir(parents=True)
-    # Tour TERMINÉ (stop_reason 'end_turn') sous un statut 'shell' figé → 'background'.
+    # Tour TERMINÉ (stop_reason 'end_turn') sous un statut 'shell' figé : l'état suit le
+    # JSONL ('waiting') et le shell de fond est signalé à part.
     (proj / 'sess-1.jsonl').write_text(
         json.dumps({'type': 'ai-title', 'aiTitle': 'Titre IA'}) + '\n'
         + json.dumps({'type': 'assistant',
@@ -43,9 +44,9 @@ def test_the_registry_cwd_resolves_the_transcript_when_proc_drifted(watcher, tmp
     """Le cwd du REGISTRE prime : sinon on slugifie un chemin qui n'existe pas et
     on perd silencieusement tout ce que le transcript porte."""
     _instance(tmp_path)
-    state, ctx, _tool, topic, last_activity, session_id = watcher.get_session_state(
+    state, ctx, _tool, topic, last_activity, session_id, bg_shell = watcher.get_session_state(
         PID, LIVE_CWD, STARTTIME, config_dir=str(tmp_path))
-    assert (state, ctx, topic) == ('background', 5, 'Titre IA')
+    assert (state, ctx, topic, bg_shell) == ('waiting', 5, 'Titre IA', True)
     assert last_activity == 1_700_000_000.0
     assert session_id == 'sess-1'
 
@@ -54,9 +55,9 @@ def test_the_live_cwd_is_the_fallback_when_the_registry_has_none(watcher, tmp_pa
     """Registre sans `cwd` (version de Claude antérieure) : le cwd /proc reste le
     seul candidat. La précédence est « registre SINON /proc », pas « registre seul »."""
     _instance(tmp_path, registry_cwd=None)
-    state, ctx, _tool, topic, _, _ = watcher.get_session_state(
+    state, ctx, _tool, topic, _, _, bg_shell = watcher.get_session_state(
         PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
-    assert (state, ctx, topic) == ('background', 5, 'Titre IA')
+    assert (state, ctx, topic, bg_shell) == ('waiting', 5, 'Titre IA', True)
 
 
 def test_a_resumed_session_reads_its_own_transcript_not_a_neighbours(watcher, tmp_path):
@@ -73,9 +74,9 @@ def test_a_resumed_session_reads_its_own_transcript_not_a_neighbours(watcher, tm
         json.dumps({'type': 'assistant',
                     'message': {'model': 'claude-opus-4-8', 'stop_reason': 'end_turn',
                                 'usage': {'input_tokens': 50_000}, 'content': []}}) + '\n')
-    state, ctx, _tool, topic, _, _ = watcher.get_session_state(
+    state, ctx, _tool, topic, _, _, bg_shell = watcher.get_session_state(
         PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
-    assert (state, ctx, topic) == ('background', 5, 'Titre IA')
+    assert (state, ctx, topic, bg_shell) == ('waiting', 5, 'Titre IA', True)
 
 
 def test_no_transcript_found_keeps_the_registry_state(watcher, tmp_path):
@@ -87,7 +88,7 @@ def test_no_transcript_found_keeps_the_registry_state(watcher, tmp_path):
         json.dumps({'type': 'assistant',
                     'message': {'model': 'claude-opus-4-8', 'stop_reason': 'end_turn',
                                 'usage': {'input_tokens': 50_000}, 'content': []}}) + '\n')
-    state, ctx, _tool, topic, _, _ = watcher.get_session_state(
+    state, ctx, _tool, topic, _, _, bg_shell = watcher.get_session_state(
         PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
     assert (state, ctx, topic) == ('working', None, None)
 
@@ -106,7 +107,7 @@ def test_a_mid_turn_system_event_does_not_read_as_a_finished_turn(watcher, tmp_p
                                   'content': [{'type': 'tool_use', 'name': 'Bash'}]}}) + '\n'
         + json.dumps({'type': 'system', 'subtype': 'informational',
                       'content': 'Backgrounding after the current tool finishes…'}) + '\n')
-    state, ctx, tool, topic, _, _ = watcher.get_session_state(
+    state, ctx, tool, topic, _, _, bg_shell = watcher.get_session_state(
         PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
     assert (state, ctx, tool, topic) == ('working', 5, 'Bash', 'Titre IA')
 
@@ -120,7 +121,7 @@ def test_a_stuck_busy_status_is_not_announced_as_background_work(watcher, tmp_pa
     reg = json.loads(reg_path.read_text())
     reg['status'] = 'busy'
     reg_path.write_text(json.dumps(reg))
-    state, ctx, _tool, topic, _, _ = watcher.get_session_state(
+    state, ctx, _tool, topic, _, _, bg_shell = watcher.get_session_state(
         PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
     assert (state, ctx, topic) == ('waiting', 5, 'Titre IA')
 
@@ -147,7 +148,7 @@ def test_a_malformed_session_id_never_reaches_the_filesystem(watcher, tmp_path):
         reg = json.loads(reg_path.read_text())
         reg['sessionId'] = sid
         reg_path.write_text(json.dumps(reg))
-        state, ctx, _tool, topic, _, _ = watcher.get_session_state(
+        state, ctx, _tool, topic, _, _, bg_shell = watcher.get_session_state(
             PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
         # Aucun transcript résolu → aucune réconciliation, l'état du registre
         # tient ('shell' → working) et rien n'est lu du disque.
@@ -183,3 +184,27 @@ def test_a_memorised_absence_never_hides_a_transcript_created_later(watcher, tmp
     assert watcher._find_transcript('sess-1', proj) is None
     jsonl.write_text(contenu)
     assert watcher._find_transcript('sess-1', proj) == jsonl
+
+
+def test_a_background_shell_never_hides_claude_availability(watcher, tmp_path):
+    """Un shell de fond survit au tour : Claude a rendu la main, donc l'état DIT
+    qu'il est dispo et le shell voyage dans son propre signal. L'ancien état
+    'background' occupait la colonne d'état pour un détail SUR la session."""
+    _instance(tmp_path)
+    state, _ctx, _tool, _topic, _la, _sid, bg_shell = watcher.get_session_state(
+        PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
+    assert (state, bg_shell) == ('waiting', True)
+    assert state != 'background'
+
+
+def test_no_shell_means_no_marker(watcher, tmp_path):
+    """Contre-épreuve : sans statut 'shell', le marqueur reste éteint — sinon il
+    ne distingue plus rien."""
+    _instance(tmp_path)
+    reg_path = tmp_path / 'sessions' / f'{PID}.json'
+    reg = json.loads(reg_path.read_text())
+    reg['status'] = 'busy'
+    reg_path.write_text(json.dumps(reg))
+    state, _ctx, _tool, _topic, _la, _sid, bg_shell = watcher.get_session_state(
+        PID, REG_CWD, STARTTIME, config_dir=str(tmp_path))
+    assert (state, bg_shell) == ('waiting', False)
