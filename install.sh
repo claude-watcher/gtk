@@ -228,6 +228,9 @@ else
 # show_agents     = true     # per-row spawned-subagent count + tooltip list
 # hide_daemons    = false    # hide the Claude Code background daemon rows
 EOF
+    # 0600 dès la création : le fichier peut recevoir un token de remote
+    # ([remote:<nom>] token=), et le widget force ce mode à chaque écriture.
+    chmod 600 "$HOME/.config/claude-watcher/config.ini"
     echo "  ~/.config/claude-watcher/config.ini"
 fi
 

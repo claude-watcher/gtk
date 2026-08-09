@@ -1,3 +1,7 @@
 .venv/
 __pycache__/
 .pytest_cache/
+.claude/scratchpad/
+.ruff_cache/
+.mypy_cache/
+_tui/
