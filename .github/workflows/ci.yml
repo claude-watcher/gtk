@@ -40,20 +40,31 @@ jobs:
       # change lands as one branch name in two repos), default branch otherwise.
       # Corollary, and it is an ORDERING CONSTRAINT, not a bug: a core change is
       # only green here once its twin is pushed to the TUI repo.
-      - name: Checkout the TUI (shared remote core, matching branch)
-        id: tui_branch
-        continue-on-error: true
-        uses: actions/checkout@v4
-        with:
-          repository: claude-watcher/tui
-          ref: ${{ github.head_ref || github.ref_name }}
-          path: _tui
+      #
+      # The revision is RESOLVED FIRST, then checked out ONCE. The previous shape
+      # — try the branch with continue-on-error, then a fallback step — broke as
+      # soon as the twin branch was merged and deleted: the failed attempt left
+      # `_tui` as a non-repository, and the fallback died on `git reset --hard
+      # HEAD` there, so the parity guard compared against an empty module and
+      # reported every shared symbol as missing. Same resolution as webui's.
+      - name: Resolve the TUI revision
+        id: sibling
+        run: |
+          set -euo pipefail
+          branch="${{ github.head_ref || github.ref_name }}"
+          ref=""
+          if git ls-remote --exit-code --heads \
+               "https://github.com/claude-watcher/tui.git" "$branch" >/dev/null 2>&1; then
+            ref="$branch"
+          fi
+          echo "tui=${ref:-<default branch>}"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout the TUI (default branch fallback)
-        if: steps.tui_branch.outcome == 'failure'
+      - name: Checkout the TUI (shared core)
         uses: actions/checkout@v4
         with:
           repository: claude-watcher/tui
+          ref: ${{ steps.sibling.outputs.ref }}
           path: _tui
 
       - name: Install uv

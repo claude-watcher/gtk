@@ -80,13 +80,16 @@ SHARED_SYMBOLS = [
 # copie, et rien ne justifie qu'elle dérive entre eux. Aucune divergence
 # tui↔gtk n'est donc déclarée sur ce bloc : les 17 symboles sont comparés.
 SHARED_DETECTION_CONSTANTS = [
-    '_CLK_TCK', '_SESSIONS_DIR', 'CLAUDE_PROJECTS_DIR', '_STATUS_MAP', '_WORKTREE_MARKER',
+    '_CLK_TCK', '_SESSIONS_DIR', 'CLAUDE_PROJECTS_DIR', '_STATUS_MAP', '_TURN_END_SUBTYPES',
+    '_WORKTREE_MARKER',
     'DEFAULT_CONTEXT_WINDOW', 'CONTEXT_200K', '_JSONL_TAIL_BYTES',
 ]
 
 SHARED_DETECTION_SYMBOLS = [
-    '_argv_value', 'scan_proc', 'get_cwd', 'get_env', 'split_worktree', 'cwd_to_project_dir',
+    '_argv_value', 'scan_proc', 'get_cwd', 'get_env', 'split_worktree', 'git_worktree',
+    'worktree_of', 'cwd_to_project_dir',
     'context_window_for', '_read_tail_lines', '_read_topic', '_parse_session_lines',
+    '_find_transcript',
     'get_session_info_from_jsonl', 'get_session_registry', 'get_session_state',
     'project_label', 'resolve_config_dir', 'display_config_dir', 'scan_sessions',
 ]
