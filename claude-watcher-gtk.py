@@ -323,7 +323,9 @@ STRINGS = {
         'title':      'CLAUDE CODE',
         'waiting':    'attente',
         'working':    'travaille',
-        'background': 'en fond',
+        'waiting_s':  'att',
+        'working_s':  'trav',
+        'bg_shell':   'shell de fond',
         'idle':       'inactif',
         'no_session': 'aucune session active',
         'attend':     'attend',
@@ -445,7 +447,9 @@ STRINGS = {
         'title':      'CLAUDE CODE',
         'waiting':    'waiting',
         'working':    'working',
-        'background': 'background',
+        'waiting_s':  'wait',
+        'working_s':  'work',
+        'bg_shell':   'background shell',
         'idle':       'idle',
         'no_session': 'no active session',
         'attend':     'waiting',
@@ -584,7 +588,8 @@ COLOR_TITLE   = "#cc8a2e"
 COLOR_WAITING = "#e86c3a"
 COLOR_WORKING = "#d4a052"
 COLOR_IDLE    = "#4caf7d"
-COLOR_BACKGROUND = "#5c8a9e"   # muted teal — un shell/tâche de fond tourne, Claude a rendu la main
+BG_SHELL_GLYPH = '⚙'         # marqueur « un shell de fond tourne »
+COLOR_BACKGROUND = "#5c8a9e"   # muted teal — couleur du marqueur ⚙ : un shell de fond tourne
 
 # Alpha values for the waiting-dot pulse (6 ticks @ 600 ms ≈ 3.6 s cycle)
 _PULSE_ALPHAS = [0.35, 0.6, 0.9, 1.0, 0.9, 0.6]
@@ -1352,10 +1357,13 @@ def get_session_state(
     pid: int, cwd: str | None,
     starttime: int = 0,
     config_dir: str | None = None,
-) -> tuple[str, int | None, str | None, str | None, float | None, str | None]:
+) -> tuple[str, int | None, str | None, str | None, float | None, str | None, bool]:
     """État de la session. Retourne (state, context_pct, tool_name, topic,
-    last_activity, session_id) — session_id sert à rattacher les subagents
-    (--parent-session-id) à leur session ; None si le registre est absent.
+    last_activity, session_id, bg_shell) — session_id sert à rattacher les
+    subagents (--parent-session-id) à leur session, None si le registre est
+    absent ; bg_shell dit qu'un shell de fond a survécu au tour. L'état ne décrit
+    QUE la disponibilité de Claude : un shell de fond est un détail SUR la
+    session, pas ce qu'elle est.
 
     Le registre ~/.claude/sessions/<pid>.json (champ `status`, temps réel) est
     prioritaire quand il existe ; selon la version de Claude Code il peut être
@@ -1367,6 +1375,7 @@ def get_session_state(
     """
     reg = get_session_registry(pid, starttime, config_dir)
     session_id = reg.get('sessionId') if reg else None
+    bg_shell = False
     # Le slug du transcript se calcule sur le cwd de DÉMARRAGE de la session, que
     # le registre enregistre. Le cwd /proc dérive dès que le dossier est renommé
     # ou que l'utilisateur fait un `cd` en cours de session — le slugifier
@@ -1396,11 +1405,9 @@ def get_session_state(
         # (sous-agents interrompus, session mise en fond). 'compacting' est EXCLU :
         # vrai travail de fond, bref. jsonl_state None (JSONL introuvable) ou
         # 'working' (tour en cours, sous-agents compris) → aucune réconciliation.
-        if jsonl_state in ('waiting', 'idle'):
-            if status == 'shell':
-                state = 'background'
-            elif status == 'busy':
-                state = jsonl_state
+        if status in ('shell', 'busy') and jsonl_state in ('waiting', 'idle'):
+            state = jsonl_state
+            bg_shell = status == 'shell'
         # Idle-since : instant EXACT du dernier changement d'état du registre
         # (ms epoch). Prioritaire sur le mtime du JSONL, qui bouge pour des
         # écritures de fond (résumés, todos) sans refléter l'inactivité réelle —
@@ -1414,7 +1421,7 @@ def get_session_state(
                 pass
     else:
         state = jsonl_state or 'idle'
-    return state, context_pct, tool, topic, last_activity, session_id
+    return state, context_pct, tool, topic, last_activity, session_id, bg_shell
 
 
 def format_elapsed(s) -> str:
@@ -1573,7 +1580,7 @@ def scan_local_sessions() -> list[dict]:
                 'elapsed':         p['elapsed'],
                 'waiting':         False,
                 'working':         False,
-                'background':      False,
+                'bg_shell':        False,
                 'context_pct':     None,
                 'tool':            None,
                 'terminal_pid':    None,
@@ -1609,7 +1616,7 @@ def scan_local_sessions() -> list[dict]:
             window_id = find_best_window(term_pid, cwd, all_windows)
 
         config_dir = resolve_config_dir(env)
-        state, context_pct, tool, topic, last_activity, session_id = get_session_state(
+        state, context_pct, tool, topic, last_activity, session_id, bg_shell = get_session_state(
             pid, cwd, p['starttime'], config_dir)
         # Worktree Claude « confirmé » (marqueur détecté ET transcript résolu) ou
         # worktree git ordinaire (prouvé par son `.git` fichier) : on affiche le
@@ -1626,7 +1633,7 @@ def scan_local_sessions() -> list[dict]:
             'elapsed':         p['elapsed'],
             'waiting':         state == 'waiting',
             'working':         state == 'working',
-            'background':      state == 'background',
+            'bg_shell':        bg_shell,
             'context_pct':     context_pct,
             'tool':            tool,
             'terminal_pid':    term_pid,
@@ -1668,15 +1675,14 @@ def scan_sessions(remote_rows: list[dict] | None = None) -> list[dict]:
         def _sort_key(s: dict) -> tuple:
             if s['waiting']:      bucket = 0
             elif s['working']:    bucket = 1
-            elif s['background']: bucket = 2
-            else:                 bucket = 3
+            else:                 bucket = 2
             la = s.get('last_activity')
-            idle = ((now - la) if la is not None else float('inf')) if bucket == 3 else 0.0
+            idle = ((now - la) if la is not None else float('inf')) if bucket == 2 else 0.0
             return (bucket, idle, s['project'].lower())
         sessions.sort(key=_sort_key)
     else:
         sessions.sort(key=lambda s: (
-            not s['waiting'], not s['working'], not s['background'], s['project'].lower()))
+            not s['waiting'], not s['working'], s['project'].lower()))
     return sessions
 
 def session_key(s: dict) -> str:
@@ -1990,7 +1996,14 @@ def adapt_remote_row(row: object, remote: dict, received_at: float,
     if pid is None:
         return None
     state = row.get('state')
-    if state not in ('waiting', 'working', 'background', 'idle', 'daemon'):
+    bg_shell = row.get('bg_shell') is True
+    # Serveur d'avant `bg_shell` : son 'background' VOULAIT dire « inactive, mais
+    # un shell de fond tourne ». On le traduit au lieu de le jeter — un client à
+    # jour lit des hôtes qui ne le sont pas encore, et perdre le signal en
+    # silence serait pire qu'une ligne de traduction.
+    if state == 'background':
+        state, bg_shell = 'idle', True
+    if state not in ('waiting', 'working', 'idle', 'daemon'):
         state = 'idle'
     idle = _as_float(row.get('idle_seconds'))
     last_activity = remote_last_activity(idle, received_at, age_seconds)
@@ -2011,7 +2024,7 @@ def adapt_remote_row(row: object, remote: dict, received_at: float,
         'elapsed':         min(REMOTE_MAX_ELAPSED_S, max(0, _as_int(row.get('elapsed')) or 0)),
         'waiting':         state == 'waiting',
         'working':         state == 'working',
-        'background':      state == 'background',
+        'bg_shell':        bg_shell,
         'context_pct':     min(100, max(0, pct)) if pct is not None else None,
         'tool':            clean_remote_str(row.get('tool'), 40),
         # Rien de local ne doit pouvoir être visé depuis une ligne distante.
@@ -2231,6 +2244,59 @@ def local_config_dirs(sessions: list[dict]) -> list[str]:
             if s.get('config_dir') and not s.get('remote')]
 
 
+# Trois niveaux de rédaction des compteurs, du plus riche au plus dense. On MESURE
+# avant de poser, au lieu de poser puis de constater l'ellipse : `is_ellipsized()`
+# n'est vrai qu'après allocation, donc y réagir crée une boucle de relayout à
+# borner. Niveau 2 en chiffres nus séparés par '/' et non en emoji : la plupart
+# des terminaux rendent un emoji sur DEUX cellules, ce qui fausserait la mesure
+# côté TUI.
+def counts_segments(waiting: int, working: int, bg_shell: int, total: int,
+                    level: int) -> list[tuple[str, str]]:
+    """Segments (texte, couleur) de la zone de compteurs, pour un niveau donné.
+
+    Un compteur à zéro n'est jamais écrit : « 0 attente » occupe la place qui
+    manque justement. Le séparateur est l'affaire de l'appelant.
+    """
+    seg: list[tuple[str, str]] = []
+    if level >= 2:
+        if waiting:  seg.append((str(waiting), COLOR_WAITING))
+        if working:  seg.append((str(working), COLOR_WORKING))
+        if bg_shell: seg.append((f'{bg_shell}{BG_SHELL_GLYPH}', COLOR_BACKGROUND))
+        seg.append((str(total), TEXT_DIM2))
+        return seg
+    if level == 1:
+        if waiting:  seg.append((f"{waiting} {tr('waiting_s')}", COLOR_WAITING))
+        if working:  seg.append((f"{working} {tr('working_s')}", COLOR_WORKING))
+        if bg_shell: seg.append((f'{bg_shell}{BG_SHELL_GLYPH}', COLOR_BACKGROUND))
+        seg.append((str(total), TEXT_DIM2))
+        return seg
+    if waiting:  seg.append((f"{waiting} {tr('waiting')}", COLOR_WAITING))
+    if working:  seg.append((f"{working} {tr('working')}", COLOR_WORKING))
+    if bg_shell: seg.append((f'{bg_shell} {BG_SHELL_GLYPH}', COLOR_BACKGROUND))
+    seg.append((f"{total} total", TEXT_DIM2))
+    return seg
+
+
+def counts_sep(level: int) -> str:
+    """Séparateur des compteurs : '/' au niveau le plus dense, ' · ' sinon."""
+    return '/' if level >= 2 else ' · '
+
+
+def fit_level(measure, budget: int, levels: int = 3) -> int:
+    """Premier niveau (0 = le plus riche) dont le rendu tient dans `budget`.
+
+    `measure(level) -> largeur`, dans l'unité de l'appelant (pixels côté GTK,
+    cellules côté TUI). Budget nul ou négatif (label pas encore alloué) → niveau
+    le plus riche : on ne dégrade pas sur une mesure qu'on n'a pas.
+    """
+    if budget <= 0:
+        return 0
+    for lvl in range(levels):
+        if measure(lvl) <= budget:
+            return lvl
+    return levels - 1
+
+
 def remotes_bar_text(remotes: list[dict], stat: dict[str, dict],
                      poll_s: float, now: float) -> str:
     """Contenu de la zone d'état : un fragment par remote CONFIGURÉ, session ou pas."""
@@ -2292,6 +2358,10 @@ def session_tooltip(s: dict, rstate: dict | None = None) -> str:
             tip = f"{tip}\n{stale}"
     if s.get('daemon'):
         return f"{tip}\n\n{tr('tip_daemon')}"
+    if s.get('bg_shell'):
+        # Le marqueur de ligne est un glyphe ; l'infobulle est le seul endroit qui
+        # dit ce qu'il signifie.
+        tip = f"{tip}\n\n{BG_SHELL_GLYPH} {tr('bg_shell')}"
     topic = (s.get('topic') or '').strip()
     if topic:
         tip = f'{tip}\n\nTopic: {topic}'
@@ -2586,8 +2656,6 @@ class SessionRow(Gtk.EventBox):
             color, badge_txt = COLOR_WAITING, tr('attend')
         elif s['working']:
             color, badge_txt = COLOR_WORKING, tr('working')
-        elif s['background']:
-            color, badge_txt = COLOR_BACKGROUND, tr('background')
         else:
             color, badge_txt = COLOR_IDLE, tr('idle')
         self._dot_color = color
@@ -2648,11 +2716,12 @@ class SessionRow(Gtk.EventBox):
                 f'<span foreground="{TEXT_DIM2}" font="Monospace 8">'
                 f'{GLib.markup_escape_text(tool)}</span>'
             )
-        elif not s['working'] and not s['waiting'] and not s['background'] \
+        elif not s['working'] and not s['waiting'] \
                 and idle_fmt != 'none' and la is not None:
             # Session inactive : la colonne outil (vide en idle) sert la durée
-            # d'inactivité = now − dernière activité (mtime du JSONL). Exclut
-            # 'background' : un fond tourne, la session n'est pas vraiment inactive.
+            # d'inactivité = now − dernière activité. Un shell de fond ne la
+            # supprime plus : Claude a rendu la main, la session EST inactive —
+            # le shell se dit dans son marqueur, pas en volant cette cellule.
             self.lbl_ctx.set_markup(
                 f'<span foreground="{TEXT_DIM2}" font="Monospace 8">'
                 f'{GLib.markup_escape_text(format_idle(time.time() - la, idle_fmt))}</span>'
@@ -2662,12 +2731,20 @@ class SessionRow(Gtk.EventBox):
         self.badge.set_markup(
             f'<span foreground="{color}" font="Monospace 8">{badge_txt}</span>'
         )
+        # Sous-ligne de DÉTAILS : sous-agents et shell de fond y cohabitent. Le
+        # marqueur n'est pas collé au badge, qui doit rester court — la ligne
+        # d'état est déjà en concurrence de largeur avec le titre et le préfixe
+        # d'une ligne distante.
         n_agents = len(s.get('agents') or [])
+        detail = []
         if n_agents:
+            detail.append(f'<span foreground="{COLOR_CLAUDE}">'
+                          f'{n_agents} {tr("agents") if n_agents > 1 else tr("agent")}</span>')
+        if s.get('bg_shell'):
+            detail.append(f'<span foreground="{COLOR_BACKGROUND}">{BG_SHELL_GLYPH} sh</span>')
+        if detail:
             self.lbl_agents.set_markup(
-                f'<span foreground="{COLOR_CLAUDE}" font="Monospace 8">'
-                f'{n_agents} {tr("agents") if n_agents > 1 else tr("agent")}</span>'
-            )
+                f'<span font="Monospace 8">{" ".join(detail)}</span>')
             self.lbl_agents.set_visible(True)
         else:
             self.lbl_agents.set_visible(False)
@@ -3272,6 +3349,7 @@ class ClaudeWatcher(Gtk.Window):
         self._drag_off   = (0, 0)
         self._save_timer = 0
         self._alpha      = 1.0
+        self._counts_first = True
         self._bg_alpha   = cfg.bg_alpha / 100.0
 
         # Position libre (--x/--y ou drag) : X11 seulement.
@@ -4140,17 +4218,18 @@ class ClaudeWatcher(Gtk.Window):
         self._mi_about.set_label(tr('about'))
         self._mi_quit.set_label(tr('quit'))
 
-    def _update_tray(self, waiting: int, working: int, background: int, total: int):
+    def _update_tray(self, waiting: int, working: int, bg_shell: int, total: int):
         if not self._tray:
             return
-        if waiting:      color = COLOR_WAITING
-        elif working:    color = COLOR_WORKING
-        elif background: color = COLOR_BACKGROUND
-        elif total:      color = COLOR_IDLE
-        else:            color = TEXT_DIM
+        # La couleur classe l'URGENCE : un shell de fond n'en est pas une, la
+        # session est disponible. Il est compté dans l'infobulle, pas ici.
+        if waiting:   color = COLOR_WAITING
+        elif working: color = COLOR_WORKING
+        elif total:   color = COLOR_IDLE
+        else:         color = TEXT_DIM
         tooltip = (
             f"{waiting} {tr('waiting')} · {working} {tr('working')} · "
-            f"{background} {tr('background')} · {total} total"
+            f"{bg_shell} {BG_SHELL_GLYPH} · {total} total"
             if total else tr('no_session')
         )
         if HAS_APPINDICATOR:
@@ -4639,28 +4718,45 @@ class ClaudeWatcher(Gtk.Window):
         return True
 
     def _rebuild_sessions(self):
-        waiting    = sum(1 for s in self.sessions if s['waiting'])
-        working    = sum(1 for s in self.sessions if s['working'])
-        background = sum(1 for s in self.sessions if s['background'])
-        total      = len(self.sessions)
+        waiting  = sum(1 for s in self.sessions if s['waiting'])
+        working  = sum(1 for s in self.sessions if s['working'])
+        bg_shell = sum(1 for s in self.sessions if s['bg_shell'])
+        total    = len(self.sessions)
 
-        self._update_tray(waiting, working, background, total)
+        self._update_tray(waiting, working, bg_shell, total)
 
-        parts = []
-        if waiting:
-            parts.append(f'<span foreground="{COLOR_WAITING}">{waiting} {tr("waiting")}</span>')
-        if working:
-            parts.append(f'<span foreground="{COLOR_WORKING}">{working} {tr("working")}</span>')
-        if background:
-            parts.append(
-                f'<span foreground="{COLOR_BACKGROUND}">{background} {tr("background")}</span>')
         if not self.sessions:
-            parts.append(f'<span foreground="{TEXT_DIM}">{tr("no_session")}</span>')
+            self.lbl_counts.set_markup(
+                f'<span font="Monospace 8" foreground="{TEXT_DIM}">{tr("no_session")}</span>')
         else:
-            parts.append(f'<span foreground="{TEXT_DIM}">{total} total</span>')
-        self.lbl_counts.set_markup(
-            f'<span font="Monospace 8">{" · ".join(parts)}</span>'
-        )
+            def plain(level):
+                return counts_sep(level).join(
+                    t for t, _ in counts_segments(waiting, working, bg_shell, total, level))
+
+            # Budget = largeur de l'EN-TÊTE moins le naturel des AUTRES enfants.
+            # Surtout PAS la largeur allouée au label : avec ellipsize=END son
+            # minimum est quasi nul et le titre (expand=True) prend le reste, si
+            # bien qu'elle mesure le texte déjà posé, pas la place disponible —
+            # une fois dégradé en '4/8' le niveau ne remontait jamais (mesuré :
+            # budget figé à 1px sur tous les ticks, y compris après élargissement).
+            # Mesurer plutôt que réagir à l'ellipse évite une boucle de relayout.
+            # Le PREMIER passage ne mesure rien de fiable : la fenêtre n'a pas
+            # encore la largeur de ses lignes (elles arrivent avec ce tour-ci), on
+            # lirait un en-tête étroit et on afficherait des chiffres nus dès
+            # l'ouverture. Budget négatif au premier tick → niveau le plus riche,
+            # la vraie mesure a lieu au tick suivant.
+            budget = -1 if self._counts_first else (
+                self._header.get_allocated_width() - sum(
+                    c.get_preferred_width()[1] for c in self._header.get_children()
+                    if c is not self.lbl_counts))
+            self._counts_first = False
+            level = fit_level(
+                lambda lvl: self.lbl_counts.create_pango_layout(plain(lvl)).get_pixel_size()[0],
+                budget)
+            parts = [f'<span foreground="{c}">{GLib.markup_escape_text(t)}</span>'
+                     for t, c in counts_segments(waiting, working, bg_shell, total, level)]
+            self.lbl_counts.set_markup(
+                f'<span font="Monospace 8">{counts_sep(level).join(parts)}</span>')
         self._update_remotes_bar()
 
         cols = self._effective_cols()
@@ -4774,7 +4870,8 @@ def dump_round():
         jsonl_state, ctx, tool, _, _ = get_session_info_from_jsonl(eff_cwd, config_dir, session_id)
         # Source de vérité : même appel que l'app, pour que `state` et `topic`
         # collent à l'affichage (topic = /rename éventuel, sinon titre IA).
-        state, _, _, topic, last_activity, _ = get_session_state(pid, cwd, p['starttime'], config_dir)
+        state, _, _, topic, last_activity, _, bg_shell = get_session_state(
+            pid, cwd, p['starttime'], config_dir)
         # Worktree : même logique que scan_sessions (label = projet parent).
         wt_root, wt_name = worktree_of(eff_cwd, last_activity is not None)
         claude_wt = split_worktree(eff_cwd)[1]
