@@ -126,7 +126,9 @@ untouched. A `.git` directory (ordinary checkout) or a `gitdir:` pointing at
 1. A single `/proc` pass enumerates both sessions and subagents. Sessions are
    `/proc/<pid>/comm` exact-matching `claude`; field 22 of `/proc/<pid>/stat`
    gives the process `starttime` (in ticks). The same pass also collects
-   **subagents** (see step 7).
+   **subagents** (see step 7). A non-interactive `claude` (`-p`/`--print`/
+   `--output-format`/`--input-format`) carrying the exact token
+   `--no-session-persistence` is skipped (headless ephemeral run, no transcript).
 2. **State (registry, when present)** — `~/.claude/sessions/<pid>.json` carries a
    `status` field updated in real time:
    - `busy` / `shell` / `compacting` → **working**
