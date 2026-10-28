@@ -21,6 +21,7 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
 - Git **worktree** sessions resolved to their real project, tagged `↳ WT: <name>`
 - Spawned subagent count per session (`N agents`), with each agent detailed in the row tooltip — toggle off in settings
 - Background daemon shown as a non-focusable `(D)` row (hideable in settings)
+- Agent SDK sessions (T3 Code, SDK scripts) hidden by default, local and remote — shown again from settings
 - Click a session row to focus its terminal window (T3 Code sessions: also switches T3 to the session's thread)
 - Right-click a session row for its menu (focus, copy the PID, or close an idle session — sends `SIGTERM`)
 - Right-click the header for the global context menu (show/hide, snooze, settings, quit)

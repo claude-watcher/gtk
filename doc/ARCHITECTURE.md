@@ -28,6 +28,7 @@ shortcut_enable = true   # global show/hide hotkey (true | false)
 show_topic      = true   # per-row session topic subtitle (true | false)
 show_agents     = true   # per-row spawned-subagent count + tooltip list (true | false)
 hide_daemons    = false  # hide the Claude Code background daemon rows (true | false)
+hide_sdk_sessions = true # hide Agent SDK sessions, CLAUDE_CODE_ENTRYPOINT=sdk-* (true | false)
 
 [remotes]
 poll_ms = 2000        # remote poll interval, separate from refresh_ms (a network round trip)
@@ -211,6 +212,12 @@ session — it has no pid-keyed registry, terminal, or transcript — so its row
 marked with a `(D)` prefix, rendered with a neutral state, and excluded from the
 "Close session" action. Set `features.hide_daemons = true` to omit daemon rows
 entirely.
+
+**Agent SDK sessions** (T3 Code, SDK scripts) are real sessions whose env carries
+`CLAUDE_CODE_ENTRYPOINT=sdk-*`. Every row carries that value raw as `entrypoint` (local:
+from the env already read; remote: copied by `adapt_remote_row`, 40 chars max, `None` if not
+a string). `features.hide_sdk_sessions` (default `true`) drops them in `scan_sessions`,
+after the local/remote merge like `hide_daemons`; a daemon row is left to `hide_daemons`.
 
 The terminal-title spinner is **not** used for state — only to pick the right
 window when focusing a multi-window terminal.

@@ -729,10 +729,16 @@ def test_row_keys_survive_two_labels_that_collide_after_elision(watcher):
 # ── Affichage : préfixe, péremption, infobulle ───────────────────────────────
 
 @pytest.fixture
-def no_markup_escape(watcher, monkeypatch):
+def no_markup_escape(watcher):
     """GLib est stubé (MagicMock) : on remet un échappement identité pour lire
     le markup produit."""
-    monkeypatch.setattr(watcher.GLib, 'markup_escape_text', lambda t: t)
+    # Pas de monkeypatch : depuis pytest 9.2, son undo SUPPRIME un auto-attribut de MagicMock.
+    saved = watcher.GLib.markup_escape_text
+    watcher.GLib.markup_escape_text = lambda t: t
+    try:
+        yield
+    finally:
+        watcher.GLib.markup_escape_text = saved
 
 
 def test_remote_row_is_prefixed_with_its_label(watcher, no_markup_escape):

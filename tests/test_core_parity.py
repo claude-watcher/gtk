@@ -96,7 +96,8 @@ SHARED_DETECTION_SYMBOLS = [
     'context_window_for', '_read_tail_lines', '_read_topic', '_parse_session_lines',
     '_find_transcript',
     'get_session_info_from_jsonl', 'get_session_registry', 'get_session_state',
-    'project_label', 'resolve_config_dir', 'display_config_dir', 'scan_sessions',
+    'project_label', 'resolve_config_dir', 'display_config_dir', 'is_sdk_session',
+    'scan_sessions',
     '_agent_running', 'session_agents',
 ]
 
