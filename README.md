@@ -22,6 +22,7 @@ A GTK3 desktop widget for Ubuntu that monitors all running Claude Code sessions 
 - Spawned subagent count per session (`N agents`), with each agent detailed in the row tooltip — toggle off in settings
 - Background daemon shown as a non-focusable `(D)` row (hideable in settings)
 - Agent SDK sessions (T3 Code, SDK scripts) hidden by default, local and remote — shown again from settings
+- The binary's helper modes (e.g. Chrome bridge `--chrome-native-host`, Chrome MCP server `--claude-in-chrome-mcp`) are not listed as sessions
 - Click a session row to focus its terminal window (T3 Code sessions: also switches T3 to the session's thread)
 - Right-click a session row for its menu (focus, copy the PID, or close an idle session — sends `SIGTERM`)
 - Right-click the header for the global context menu (show/hide, snooze, settings, quit)
