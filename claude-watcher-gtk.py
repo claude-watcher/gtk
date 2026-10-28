@@ -657,6 +657,10 @@ def _argv_value(argv: list[str], flag: str) -> str | None:
         return None
 
 
+# Modes helper du binaire `claude`, aiguillés sur argv[1] : jamais une session.
+_HELPER_MODES = frozenset({'--chrome-native-host', '--claude-in-chrome-mcp', '--eval-mock-server'})
+
+
 def scan_proc(collect_agents: bool = True) -> tuple[list[dict], dict[str, list[dict]]]:
     """Une seule passe /proc → (sessions/démons 'claude', subagents par parent).
 
@@ -679,6 +683,9 @@ def scan_proc(collect_agents: bool = True) -> tuple[list[dict], dict[str, list[d
     portant le token argv exact `--no-session-persistence` est ignoré : exécution
     headless éphémère (ex. génération de titre T3 Code), sans transcript ni rien
     à surveiller.
+
+    Les modes helper du binaire (`_HELPER_MODES` en argv[1], ex. pont Chrome,
+    serveur MCP Chrome) sont ignorés aussi : lancés par un autre process, pas une session.
     """
     try:
         uptime = float(Path('/proc/uptime').read_text().split()[0])
@@ -713,6 +720,9 @@ def scan_proc(collect_agents: bool = True) -> tuple[list[dict], dict[str, list[d
                 argv = (entry / 'cmdline').read_bytes().decode(errors='ignore').split('\0')
             except OSError:
                 argv = []
+            # argv[1] seulement : c'est là que le binaire aiguille ses modes helper.
+            if len(argv) > 1 and argv[1] in _HELPER_MODES:
+                continue
             # Tokens exacts (un substring dans un prompt/JSON ne compte pas) ; le
             # flag n'agit qu'en mode print, une session interactive persiste.
             if '--no-session-persistence' in argv and any(

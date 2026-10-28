@@ -22,6 +22,7 @@ Un widget de bureau GTK3 pour Ubuntu qui surveille toutes les sessions Claude Co
 - Nombre de sous-agents lancés par session (`N agents`), chacun détaillé dans l'infobulle de la ligne — désactivable dans les réglages
 - Démon de fond affiché en ligne `(D)` non-focusable (masquable dans les réglages)
 - Sessions Agent SDK (T3 Code, scripts SDK) masquées par défaut, locales et distantes — réaffichables dans les réglages
+- Modes helper du binaire (ex. pont Chrome `--chrome-native-host`, serveur MCP Chrome `--claude-in-chrome-mcp`) non listés comme sessions
 - Clic sur une session pour focus le terminal correspondant (sessions T3 Code : bascule aussi T3 sur le thread de la session)
 - Clic droit sur une session pour son menu (focus, copier le PID, ou fermer une session inactive — envoie `SIGTERM`)
 - Clic droit sur l'en-tête pour le menu contextuel global (afficher/masquer, snooze, réglages, quitter)

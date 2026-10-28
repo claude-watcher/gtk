@@ -6,6 +6,9 @@ une ligne en double. `scan_proc` les ignore, sur tokens argv EXACTS, et seulemen
 en mode non interactif (`-p`/`--print`/`--output-format`/`--input-format`) : le
 flag n'agit qu'en mode print, une session interactive persiste son transcript.
 
+Même traitement pour les modes helper du binaire (`_HELPER_MODES` en argv[1],
+ex. pont Chrome, serveur MCP Chrome), lancés par un autre process.
+
 Faux /proc dans tmp_path : `Path` du module est redirigé, `scan_proc` le lit en dur.
 """
 
@@ -93,6 +96,17 @@ def test_unreadable_cmdline_is_still_listed(watcher, fake_proc):
     """004-AC4 : cmdline illisible → listé comme aujourd'hui (non-démon)."""
     fake_proc(40, None)
     assert _pids(watcher) == {40: False}
+
+
+def test_helper_modes_are_hidden_at_argv1_only(watcher, fake_proc):
+    """Mode helper en argv[1] → aucune ligne ; ailleurs dans argv (option, prompt) → listé."""
+    fake_proc(50, ['/home/u/.local/bin/claude', '--chrome-native-host'])
+    fake_proc(51, ['claude', '--claude-in-chrome-mcp'])
+    fake_proc(52, ['claude', '--eval-mock-server'])
+    fake_proc(53, ['claude', '-c', '--chrome-native-host'])
+    fake_proc(54, ['claude', '--append-system-prompt', 'see --chrome-native-host'])
+    fake_proc(55, ['claude', '--chrome-native-host-x'])
+    assert _pids(watcher) == {53: False, 54: False, 55: False}
 
 
 def test_scan_proc_is_under_parity_guard():
