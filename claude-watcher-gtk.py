@@ -182,6 +182,8 @@ def load_config() -> dict:
         'show_agents': f.get('show_agents', 'true').lower() == 'true',
         # Démon Claude Code : affiché par défaut, balisé (D) ; masquable ici.
         'hide_daemons': f.get('hide_daemons', 'false').lower() == 'true',
+        # Sessions Agent SDK (T3 Code…) : masquées par défaut, pilotées depuis leur outil.
+        'hide_sdk_sessions': f.get('hide_sdk_sessions', 'true').lower() == 'true',
         'refresh_ms': int(d.get('refresh_ms', 2000)),
         'snooze_sec': int(d.get('snooze_sec', 30)),
         'bg_alpha':   _parse_bg_alpha(d.get('bg_alpha', BG_ALPHA_DEFAULT)),
@@ -306,6 +308,7 @@ def parse_args(defaults: dict, argv=None) -> argparse.Namespace:
     args.show_topic = defaults['show_topic']
     args.show_agents = defaults['show_agents']
     args.hide_daemons = defaults['hide_daemons']
+    args.hide_sdk_sessions = defaults['hide_sdk_sessions']
     args.refresh_ms = defaults['refresh_ms']
     args.snooze_sec        = defaults['snooze_sec']
     args.bg_alpha          = defaults['bg_alpha']
@@ -398,6 +401,7 @@ STRINGS = {
         'fld_show_topic': 'Afficher le sujet de session',
         'fld_show_agents': 'Afficher les sous-agents',
         'fld_hide_daemons': 'Masquer les démons',
+        'fld_hide_sdk_sessions': 'Masquer les sessions SDK (T3 Code…)',
         'fld_sort':        'Tri',
         'sort_default':    'Par défaut (projet)',
         'sort_idle':       'Par inactivité',
@@ -521,6 +525,7 @@ STRINGS = {
         'fld_show_topic': 'Show session topic',
         'fld_show_agents': 'Show subagents',
         'fld_hide_daemons': 'Hide daemons',
+        'fld_hide_sdk_sessions': 'Hide SDK sessions (T3 Code…)',
         'fld_sort':        'Sort',
         'sort_default':    'Default (project)',
         'sort_idle':       'By idle time',
@@ -834,7 +839,7 @@ def get_env(pid: int) -> dict[str, str]:
     try:
         return dict(
             kv.split('=', 1)
-            for kv in Path(f'/proc/{pid}/environ').read_bytes().decode().split('\x00')
+            for kv in Path(f'/proc/{pid}/environ').read_bytes().decode(errors='replace').split('\x00')
             if '=' in kv
         )
     except Exception:
@@ -1821,6 +1826,7 @@ def scan_local_sessions() -> list[dict]:
             if getattr(CFG, 'hide_daemons', False):
                 continue
             cwd = get_cwd(pid)
+            env = get_env(pid)
             sessions.append({
                 'pid':             pid,
                 'starttime':       p['starttime'],
@@ -1838,7 +1844,8 @@ def scan_local_sessions() -> list[dict]:
                 'window_id':       None,
                 'kitty_socket':    None,
                 'kitty_window_id': None,
-                'config_dir':      resolve_config_dir(get_env(pid)),
+                'config_dir':      resolve_config_dir(env),
+                'entrypoint':      env.get('CLAUDE_CODE_ENTRYPOINT') or None,
                 'last_activity':   None,
                 'agents':          [],
                 'session_id':      None,
@@ -1897,6 +1904,7 @@ def scan_local_sessions() -> list[dict]:
             'kitty_socket':    kitty_socket,
             'kitty_window_id': kitty_window_id,
             'config_dir':      config_dir,
+            'entrypoint':      env.get('CLAUDE_CODE_ENTRYPOINT') or None,
             'last_activity':   last_activity,
             'agents':          (subagents.get(session_id, []) if session_id else []) + running_agents,
             'session_id':      session_id,
@@ -1904,6 +1912,12 @@ def scan_local_sessions() -> list[dict]:
             't3_home':         str(home) if (home := t3_home(env)) else None,
         })
     return sessions
+
+
+def is_sdk_session(s: dict) -> bool:
+    """Session lancée via l'Agent SDK (T3 Code, scripts SDK) : `CLAUDE_CODE_ENTRYPOINT` en `sdk-*`."""
+    ep = s.get('entrypoint')
+    return isinstance(ep, str) and ep.startswith('sdk-')
 
 
 def scan_sessions(remote_rows: list[dict] | None = None) -> list[dict]:
@@ -1920,6 +1934,9 @@ def scan_sessions(remote_rows: list[dict] | None = None) -> list[dict]:
     # appartiennent au cache du poller, les muter le corromprait durablement.
     if getattr(CFG, 'hide_daemons', False):
         sessions = [s for s in sessions if not s.get('daemon')]
+    # Un démon n'est pas une session : seul hide_daemons le gouverne, quel que soit son entrypoint.
+    if getattr(CFG, 'hide_sdk_sessions', True):
+        sessions = [s for s in sessions if s.get('daemon') or not is_sdk_session(s)]
     if not getattr(CFG, 'show_agents', True):
         sessions = [dict(s, agents=[]) if s.get('agents') else s for s in sessions]
     # Priorité d'état (attente > travaille > idle) dans tous les modes. En mode
@@ -2294,6 +2311,7 @@ def adapt_remote_row(row: object, remote: dict, received_at: float,
         # Affichage seulement : _sync_status_monitors ne DOIT PAS en faire un
         # chemin local (le ~/.claude d'un remote existe aussi ici).
         'config_dir':      clean_remote_str(row.get('config_dir'), 60),
+        'entrypoint':      clean_remote_str(row.get('entrypoint'), 40),
         'agents':          agents,
         'daemon':          bool(row.get('daemon')) or state == 'daemon',
         'remote':          remote['label'],
@@ -3173,6 +3191,7 @@ class SettingsDialog(Gtk.Dialog):
             'show_topic': getattr(CFG, 'show_topic', True),
             'show_agents': getattr(CFG, 'show_agents', True),
             'hide_daemons': getattr(CFG, 'hide_daemons', False),
+            'hide_sdk_sessions': getattr(CFG, 'hide_sdk_sessions', True),
             'refresh_ms': CFG.refresh_ms,
             'snooze_sec': CFG.snooze_sec,
             # Effective on-screen value, not CFG: shift+scroll moves it away
@@ -3364,57 +3383,61 @@ class SettingsDialog(Gtk.Dialog):
         self._chk_show_agents.set_active(getattr(CFG, 'show_agents', True))
         gd.attach(gutter(self._chk_show_agents), 3, 1, 3, 1)
 
-        gd.attach(Gtk.Separator(), 0, 2, 6, 1)
+        self._chk_hide_sdk_sessions = Gtk.CheckButton(label=tr('fld_hide_sdk_sessions'))
+        self._chk_hide_sdk_sessions.set_active(getattr(CFG, 'hide_sdk_sessions', True))
+        gd.attach(self._chk_hide_sdk_sessions, 0, 2, 3, 1)
+
+        gd.attach(Gtk.Separator(), 0, 3, 6, 1)
 
         self._lbl_width = field_label(tr('fld_width'))
-        gd.attach(self._lbl_width, 0, 3, 1, 1)
+        gd.attach(self._lbl_width, 0, 4, 1, 1)
         self._spin_width = Gtk.SpinButton.new_with_range(200, 800, 10)
         self._spin_width.set_value(CFG.width)
-        gd.attach(self._spin_width, 1, 3, 1, 1)
-        gd.attach(Gtk.Label(label="px"), 2, 3, 1, 1)
+        gd.attach(self._spin_width, 1, 4, 1, 1)
+        gd.attach(Gtk.Label(label="px"), 2, 4, 1, 1)
 
-        gd.attach(gutter(field_label(tr('fld_columns'))), 3, 3, 1, 1)
+        gd.attach(gutter(field_label(tr('fld_columns'))), 3, 4, 1, 1)
         self._spin_columns = Gtk.SpinButton.new_with_range(1, 6, 1)
         self._spin_columns.set_value(getattr(CFG, 'columns', 1))
-        gd.attach(self._spin_columns, 4, 3, 1, 1)
+        gd.attach(self._spin_columns, 4, 4, 1, 1)
 
         # « Hauteur max » : icône info (tooltip au survol) plutôt qu'un « (0 = écran) »
         # accolé — l'explication complète tient dans le tooltip.
-        gd.attach(info_label(tr('fld_max_height'), tr('help_max_height')), 0, 4, 1, 1)
+        gd.attach(info_label(tr('fld_max_height'), tr('help_max_height')), 0, 5, 1, 1)
         # 0 = pas de limite propre (l'écran borne) ; pas-50 px ; plafond large.
         self._spin_max_height = Gtk.SpinButton.new_with_range(0, 4000, 50)
         self._spin_max_height.set_value(getattr(CFG, 'max_height', 0))
-        gd.attach(self._spin_max_height, 1, 4, 1, 1)
-        gd.attach(Gtk.Label(label="px"), 2, 4, 1, 1)
+        gd.attach(self._spin_max_height, 1, 5, 1, 1)
+        gd.attach(Gtk.Label(label="px"), 2, 5, 1, 1)
 
-        gd.attach(field_label(tr('fld_bg_alpha')), 0, 5, 1, 1)
+        gd.attach(field_label(tr('fld_bg_alpha')), 0, 6, 1, 1)
         # 20 floor mirrors _set_effective_alpha — lower values would silently snap
         self._spin_bg_alpha = Gtk.SpinButton.new_with_range(20, 100, 1)
         self._spin_bg_alpha.set_value(round(parent._effective_alpha() * 100))
-        gd.attach(self._spin_bg_alpha, 1, 5, 1, 1)
-        gd.attach(Gtk.Label(label="%"), 2, 5, 1, 1)
+        gd.attach(self._spin_bg_alpha, 1, 6, 1, 1)
+        gd.attach(Gtk.Label(label="%"), 2, 6, 1, 1)
         btn_bg_default = Gtk.Button(label=f"{tr('btn_default')} ({BG_ALPHA_DEFAULT})")
         # set_value fires value-changed → live preview updates immediately
         btn_bg_default.connect(
             'clicked', lambda _b: self._spin_bg_alpha.set_value(BG_ALPHA_DEFAULT))
-        gd.attach(gutter(btn_bg_default), 3, 5, 2, 1)
+        gd.attach(gutter(btn_bg_default), 3, 6, 2, 1)
 
-        gd.attach(Gtk.Separator(), 0, 6, 6, 1)
+        gd.attach(Gtk.Separator(), 0, 7, 6, 1)
 
-        gd.attach(field_label(tr('fld_sort')), 0, 7, 1, 1)
+        gd.attach(field_label(tr('fld_sort')), 0, 8, 1, 1)
         self._combo_sort = Gtk.ComboBoxText()
         self._combo_sort.append('default', tr('sort_default'))
         self._combo_sort.append('idle',    tr('sort_idle'))
         self._combo_sort.set_active_id(getattr(CFG, 'sort_mode', 'default'))
-        gd.attach(self._combo_sort, 1, 7, 4, 1)
+        gd.attach(self._combo_sort, 1, 8, 4, 1)
 
-        gd.attach(field_label(tr('fld_idle_format')), 0, 8, 1, 1)
+        gd.attach(field_label(tr('fld_idle_format')), 0, 9, 1, 1)
         self._combo_idle = Gtk.ComboBoxText()
         self._combo_idle.append('none',    tr('idle_none'))
         self._combo_idle.append('loose',   tr('idle_loose'))
         self._combo_idle.append('precise', tr('idle_precise'))
         self._combo_idle.set_active_id(getattr(CFG, 'idle_format', 'none'))
-        gd.attach(self._combo_idle, 1, 8, 4, 1)
+        gd.attach(self._combo_idle, 1, 9, 4, 1)
 
         # ── Onglet Distants (LECTURE SEULE) ──────────────────────────────────
         # Les remotes sont lus au démarrage : les modifier ici voudrait dire
@@ -3469,6 +3492,7 @@ class SettingsDialog(Gtk.Dialog):
             (self._chk_show_topic,'toggled'),
             (self._chk_show_agents,  'toggled'),
             (self._chk_hide_daemons, 'toggled'),
+            (self._chk_hide_sdk_sessions, 'toggled'),
             (self._spin_bg_alpha, 'value-changed'),
             (self._spin_columns,    'value-changed'),
             (self._spin_max_height, 'value-changed'),
@@ -3513,6 +3537,7 @@ class SettingsDialog(Gtk.Dialog):
             'show_topic': self._chk_show_topic.get_active(),
             'show_agents': self._chk_show_agents.get_active(),
             'hide_daemons': self._chk_hide_daemons.get_active(),
+            'hide_sdk_sessions': self._chk_hide_sdk_sessions.get_active(),
             'refresh_ms': int(self._spin_refresh.get_value()),
             'snooze_sec': int(self._spin_snooze.get_value()),
             'bg_alpha':   int(self._spin_bg_alpha.get_value()),
@@ -4351,6 +4376,7 @@ class ClaudeWatcher(Gtk.Window):
         CFG.show_topic = values['show_topic']  # lu par get_session_info_from_jsonl au _refresh()
         CFG.show_agents = values['show_agents']    # relu par scan_sessions au _refresh()
         CFG.hide_daemons = values['hide_daemons']  # relu par scan_sessions au _refresh()
+        CFG.hide_sdk_sessions = values['hide_sdk_sessions']  # idem
         if values['bg_alpha'] != round(self._effective_alpha() * 100):
             self._set_effective_alpha(values['bg_alpha'] / 100.0)
         # _compute_xy lit les attributs d'instance, pas CFG — garder en sync
@@ -4400,6 +4426,7 @@ class ClaudeWatcher(Gtk.Window):
                 'show_topic':      'true' if values['show_topic'] else 'false',
                 'show_agents':     'true' if values['show_agents'] else 'false',
                 'hide_daemons':    'true' if values['hide_daemons'] else 'false',
+                'hide_sdk_sessions': 'true' if values['hide_sdk_sessions'] else 'false',
             },
             'display': {
                 'mode':        'free' if values['free'] else 'corner',
@@ -5119,6 +5146,7 @@ def dump_round():
             print(f"pid {pid}  {project_label(cwd)}  ({format_elapsed(p['elapsed'])})")
             print(f"  cwd          {cwd or '?'}")
             print(f"  config_dir   {display_config_dir(config_dir) or '(default)'}")
+            print(f"  entrypoint   {env.get('CLAUDE_CODE_ENTRYPOINT') or '(none)'}")
             print("  => DAEMON    (marqué (D), pas une session)")
             print()
             continue
@@ -5142,6 +5170,7 @@ def dump_round():
         print(f"  cwd          {eff_cwd or '?'}")
         print(f"  worktree     {wt_name or ('(detected, unconfirmed)' if claude_wt else '(none)')}")  # noqa: E501 (ligne préexistante, cf. pyproject.toml)
         print(f"  config_dir   {display_config_dir(config_dir) or '(default)'}")
+        print(f"  entrypoint   {env.get('CLAUDE_CODE_ENTRYPOINT') or '(none)'}")
         print(f"  session_id   {session_id or '(none)'}")
         print(f"  reg.status   {reg_status!r} -> {reg_mapped}")
         print(f"  jsonl_state  {jsonl_state!r}")
